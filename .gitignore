@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.log
+coverage/
+.ai-bridge/
+.codexpro/
+.DS_Store
+Thumbs.db
+*.local

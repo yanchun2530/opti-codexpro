@@ -1,0 +1,1686 @@
+import { spawn, spawnSync } from 'node:child_process';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
+function encode(message) {
+  return `${JSON.stringify(message)}\n`;
+}
+
+class McpStdioClient {
+  constructor(command, args, options) {
+    this.child = spawn(command, args, options);
+    this.buffer = '';
+    this.nextId = 1;
+    this.pending = new Map();
+    this.child.stdout.on('data', (chunk) => this.onData(String(chunk)));
+    this.child.stderr.on('data', (chunk) => process.stderr.write(chunk));
+    this.child.on('exit', (code) => {
+      for (const { reject } of this.pending.values()) reject(new Error(`server exited ${code}`));
+    });
+  }
+
+  onData(chunk) {
+    this.buffer += chunk;
+    while (true) {
+      const index = this.buffer.indexOf('\n');
+      if (index < 0) return;
+      const line = this.buffer.slice(0, index).replace(/\r$/, '');
+      this.buffer = this.buffer.slice(index + 1);
+      if (!line.trim()) continue;
+      const msg = JSON.parse(line);
+      if (msg.id && this.pending.has(msg.id)) {
+        const { resolve, reject, timer } = this.pending.get(msg.id);
+        clearTimeout(timer);
+        this.pending.delete(msg.id);
+        if (msg.error) reject(new Error(msg.error.message));
+        else resolve(msg.result);
+      }
+    }
+  }
+
+  request(method, params) {
+    const id = this.nextId++;
+    const msg = { jsonrpc: '2.0', id, method, params };
+    this.child.stdin.write(encode(msg));
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${method}`)), 15000);
+      timer.unref();
+      this.pending.set(id, { resolve, reject, timer });
+    });
+  }
+
+  notify(method, params = {}) {
+    this.child.stdin.write(encode({ jsonrpc: '2.0', method, params }));
+  }
+
+  close() {
+    this.child.kill('SIGTERM');
+  }
+}
+
+const pkg = JSON.parse(await fs.readFile('package.json', 'utf8'));
+
+function assertCommand(args, expected) {
+  const result = spawnSync(process.execPath, args, { cwd: path.resolve('.'), encoding: 'utf8' });
+  if (result.status !== 0) {
+    throw new Error(`${args.join(' ')} failed: ${result.stderr || result.stdout}`);
+  }
+  if (!result.stdout.includes(expected)) {
+    throw new Error(`${args.join(' ')} did not print ${expected}: ${result.stdout}`);
+  }
+}
+
+assertCommand(['dist/stdio.js', '--version'], pkg.version);
+assertCommand(['dist/stdio.js', '--help'], 'CodexPro MCP stdio server');
+assertCommand(['dist/http.js', '--version'], pkg.version);
+assertCommand(['dist/http.js', '--help'], 'CodexPro MCP HTTP server');
+
+const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-smoke-'));
+const alternateWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-smoke-alternate-'));
+await fs.writeFile(path.join(alternateWorkspace, 'selected.txt'), 'alternate workspace\n', 'utf8');
+await fs.writeFile(path.join(tmp, 'demo.txt'), 'alpha\nread\nread\nomega\n', 'utf8');
+await fs.writeFile(path.join(tmp, 'other.txt'), 'keep\n', 'utf8');
+await fs.writeFile(path.join(tmp, 'patch-race.txt'), 'patch race initial\n', 'utf8');
+await fs.writeFile(path.join(tmp, 'config.txt'), 'OPENAI_API_KEY=sk-realSecretValue123\n', 'utf8');
+await fs.writeFile(path.join(tmp, 'AGENTS.md'), '# Smoke Agents\n\n- Preserve demo.txt.\n', 'utf8');
+const codexHistoryDir = path.join(tmp, 'codex-history');
+const codexSessionDir = path.join(codexHistoryDir, 'sessions', '2026', '06', '20');
+await fs.mkdir(codexSessionDir, { recursive: true });
+const codexSessionPath = path.join(codexSessionDir, 'rollout-2026-06-20T01-02-03-019cc369-bd7c-7891-b371-7b20b4fe0b18.jsonl');
+await fs.writeFile(codexSessionPath, [
+  JSON.stringify({ timestamp: '2026-06-20T01:02:03Z', type: 'session_meta', payload: { id: '019cc369-bd7c-7891-b371-7b20b4fe0b18', cwd: tmp } }),
+  JSON.stringify({ timestamp: '2026-06-20T01:02:04Z', type: 'response_item', payload: { type: 'message', role: 'user', content: 'Fix the smoke session browser' } }),
+  JSON.stringify({ timestamp: '2026-06-20T01:02:05Z', type: 'response_item', payload: { type: 'message', role: 'assistant', content: 'Session browser plan.' } }),
+  JSON.stringify({ timestamp: '2026-06-20T01:02:06Z', type: 'response_item', payload: { type: 'function_call', name: 'bash' } }),
+  JSON.stringify({ timestamp: '2026-06-20T01:02:07Z', type: 'response_item', payload: { type: 'function_call_output', output: 'ok' } })
+].join('\n') + '\n', 'utf8');
+const olderCodexSessionId = '019cc368-1111-7222-8333-123456789abc';
+await fs.writeFile(path.join(codexSessionDir, `rollout-2026-06-19T01-02-03-${olderCodexSessionId}.jsonl`), [
+  JSON.stringify({ timestamp: '2026-06-19T01:02:03Z', type: 'session_meta', payload: { id: olderCodexSessionId, cwd: tmp } }),
+  JSON.stringify({ timestamp: '2026-06-19T01:02:04Z', type: 'response_item', payload: { type: 'message', role: 'user', content: 'Older session still readable by id' } })
+].join('\n') + '\n', 'utf8');
+const largeCodexSessionId = '019cc367-aaaa-7333-8444-123456789def';
+await fs.writeFile(path.join(codexSessionDir, `rollout-2026-06-18T01-02-03-${largeCodexSessionId}.jsonl`), [
+  JSON.stringify({ timestamp: '2026-06-18T01:02:03Z', type: 'session_meta', payload: { id: largeCodexSessionId, cwd: tmp } }),
+  JSON.stringify({ timestamp: '2026-06-18T01:02:04Z', type: 'response_item', payload: { type: 'message', role: 'user', content: 'Large metadata session' } }),
+  JSON.stringify({ timestamp: '2026-06-18T01:02:05Z', type: 'response_item', payload: { type: 'function_call_output', output: 'x'.repeat(140000) } }),
+  JSON.stringify({ timestamp: '2026-06-18T01:02:06Z', type: 'response_item', payload: { type: 'message', role: 'assistant', content: 'Large tail summary' } })
+].join('\n') + '\n', 'utf8');
+const oversizedCodexSessionId = '019cc365-cccc-7555-8666-123456789aaa';
+const oversizedCodexSessionPath = path.join(codexSessionDir, `rollout-2026-06-16T01-02-03-${oversizedCodexSessionId}.jsonl`);
+await fs.writeFile(oversizedCodexSessionPath, [
+  JSON.stringify({ timestamp: '2026-06-16T01:02:03Z', type: 'session_meta', payload: { id: oversizedCodexSessionId, cwd: tmp } }),
+  JSON.stringify({ timestamp: '2026-06-16T01:02:04Z', type: 'response_item', payload: { type: 'message', role: 'user', content: 'Oversized session first request' } }),
+  JSON.stringify({ timestamp: '2026-06-16T01:02:05Z', type: 'response_item', payload: { type: 'function_call_output', output: 'x'.repeat(20_100_000) } }),
+  JSON.stringify({ timestamp: '2026-06-16T01:02:06Z', type: 'response_item', payload: { type: 'message', role: 'assistant', content: 'Oversized session tail answer' } }),
+  JSON.stringify({ timestamp: '2026-06-16T01:02:07Z', type: 'response_item', payload: { type: 'message', role: 'user', content: 'Oversized session latest request' } })
+].join('\n') + '\n', 'utf8');
+const oversizedSourceBeforeRead = await fs.stat(oversizedCodexSessionPath);
+const byteBoundaryCodexSessionId = '019cc364-dddd-7666-8777-123456789aaa';
+await fs.writeFile(path.join(codexSessionDir, `rollout-2026-06-15T01-02-03-${byteBoundaryCodexSessionId}.jsonl`), [
+  JSON.stringify({ timestamp: '2026-06-15T01:02:03Z', type: 'session_meta', payload: { id: byteBoundaryCodexSessionId, cwd: tmp } }),
+  JSON.stringify({ timestamp: '2026-06-15T01:02:04Z', type: 'response_item', payload: { type: 'message', role: 'assistant', content: `${'a'.repeat(3999)}😀` } })
+].join('\n') + '\n', 'utf8');
+const unreadableCodexSessionPath = path.join(codexSessionDir, 'rollout-2026-06-17T01-02-03-019cc366-bbbb-7444-8555-123456789aaa.jsonl');
+await fs.writeFile(unreadableCodexSessionPath, [
+  JSON.stringify({ timestamp: '2026-06-17T01:02:03Z', type: 'session_meta', payload: { id: '019cc366-bbbb-7444-8555-123456789aaa', cwd: tmp } })
+].join('\n') + '\n', 'utf8');
+await fs.chmod(unreadableCodexSessionPath, 0o000);
+await fs.mkdir(path.join(tmp, '.codex', 'skills', 'smoke-skill'), { recursive: true });
+await fs.writeFile(path.join(tmp, '.codex', 'skills', 'smoke-skill', 'SKILL.md'), [
+  '---',
+  'name: smoke-skill',
+  'description: Smoke test skill discovery.',
+  '---',
+  '',
+  '# Smoke Skill',
+  ''
+].join('\n'), 'utf8');
+await fs.mkdir(path.join(tmp, '.agents', 'skills', 'smoke-skill'), { recursive: true });
+await fs.writeFile(path.join(tmp, '.agents', 'skills', 'smoke-skill', 'SKILL.md'), [
+  '---',
+  'name: smoke-skill',
+  'description: Duplicate smoke test skill discovery.',
+  '---',
+  '',
+  '# Duplicate Smoke Skill',
+  ''
+].join('\n'), 'utf8');
+const outsideSkillRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-outside-skills-'));
+await fs.mkdir(path.join(outsideSkillRoot, 'outside-skill'), { recursive: true });
+await fs.writeFile(path.join(outsideSkillRoot, 'outside-skill', 'SKILL.md'), [
+  '---',
+  'name: outside-skill',
+  'description: Outside workspace skill.',
+  '---',
+  '',
+  '# Outside Skill',
+  ''
+].join('\n'), 'utf8');
+try {
+  await fs.symlink(outsideSkillRoot, path.join(tmp, 'skills'), 'dir');
+} catch (error) {
+  if (process.platform !== 'win32' || error?.code !== 'EPERM') throw error;
+}
+await fs.writeFile(path.join(tmp, 'package.json'), JSON.stringify({
+  scripts: {
+    'test': "node --test",
+    'build:clients': "node -e \"console.log('clients ok')\""
+  }
+}, null, 2), 'utf8');
+await fs.mkdir(path.join(tmp, 'src'), { recursive: true });
+await fs.writeFile(path.join(tmp, 'src', 'auth.ts'), 'export function authenticate(user) { return Boolean(user); }\n', 'utf8');
+await fs.mkdir(path.join(tmp, 'test'), { recursive: true });
+await fs.writeFile(path.join(tmp, 'test', 'auth.test.ts'), "import { authenticate } from '../src/auth.js';\nvoid authenticate('test');\n", 'utf8');
+await fs.writeFile(path.join(tmp, 'é.ts'), 'export const accent = 1;\n', 'utf8');
+await fs.writeFile(path.join(tmp, '旧名.ts'), 'export const renamed = true;\n', 'utf8');
+await fs.writeFile(
+  path.join(tmp, 'search-overflow.txt'),
+  Array.from({ length: 800 }, (_, index) => `overflow-marker-${String(index).padStart(4, '0')} ${'x'.repeat(80)}`).join('\n') + '\n',
+  'utf8'
+);
+await fs.writeFile(
+  path.join(tmp, 'pixel.png'),
+  Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')
+);
+const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-outside-'));
+await fs.writeFile(path.join(outside, 'secret.txt'), 'do-not-read', 'utf8');
+const danglingSymlinks = [];
+for (const [linkPath, targetPath] of [
+  ['dangling-outside.txt', path.join(outside, 'created-outside.txt')],
+  ['dangling-env.txt', path.join(tmp, '.env')]
+]) {
+  try {
+    await fs.symlink(targetPath, path.join(tmp, linkPath));
+    danglingSymlinks.push(linkPath);
+  } catch (error) {
+    if (process.platform !== 'win32' || error?.code !== 'EPERM') throw error;
+  }
+}
+let symlinkEscapePath = 'secret-link.txt';
+try {
+  await fs.symlink(path.join(outside, 'secret.txt'), path.join(tmp, symlinkEscapePath));
+} catch (error) {
+  if (process.platform !== 'win32' || error?.code !== 'EPERM') throw error;
+  symlinkEscapePath = 'secret-link-dir/secret.txt';
+  await fs.symlink(outside, path.join(tmp, 'secret-link-dir'), 'junction');
+}
+for (const args of [['init'], ['config', 'core.quotePath', 'true'], ['add', 'demo.txt', 'other.txt', 'patch-race.txt', 'AGENTS.md', 'package.json', 'src/auth.ts', 'test/auth.test.ts', 'search-overflow.txt', 'é.ts', '旧名.ts']]) {
+  const result = spawnSync('git', args, { cwd: tmp, encoding: 'utf8' });
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(' ')} failed: ${result.stderr || result.stdout}`);
+  }
+}
+const commitResult = spawnSync('git', ['-c', 'user.email=smoke@example.com', '-c', 'user.name=Smoke Test', 'commit', '-m', 'initial smoke fixture'], { cwd: tmp, encoding: 'utf8' });
+if (commitResult.status !== 0) {
+  throw new Error(`git commit failed: ${commitResult.stderr || commitResult.stdout}`);
+}
+
+const client = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--allow-root', alternateWorkspace, '--bash', 'safe', '--tool-mode', 'full'], {
+  cwd: path.resolve('.'),
+  env: {
+    ...process.env,
+    CODEXPRO_ROOT: tmp,
+    CODEXPRO_ALLOWED_ROOTS: [tmp, alternateWorkspace].join(path.delimiter),
+    CODEXPRO_WIDGET_DOMAIN: 'https://widgets.codexpro.test',
+    CODEXPRO_TOOL_CARDS: '0'
+  }
+});
+
+await client.request('initialize', {
+  protocolVersion: '2024-11-05',
+  capabilities: {},
+  clientInfo: { name: 'codexpro-smoke', version: '0.1.0' }
+});
+client.notify('notifications/initialized');
+const tools = await client.request('tools/list', {});
+const toolNames = tools.tools.map((tool) => tool.name);
+for (const expected of ['server_config', 'codexpro_self_test', 'codexpro_inventory', 'list_workspaces', 'open_current_workspace', 'open_workspace', 'workspace_snapshot', 'inspect_workspace', 'tree', 'search', 'load_skill', 'read', 'view_image', 'write', 'edit', 'apply_patch', 'import_file', 'bash', 'git_status', 'git_diff', 'show_changes', 'read_handoff', 'wait_for_handoff', 'codex_context', 'handoff_to_agent', 'handoff_to_codex', 'export_pro_context']) {
+  if (!toolNames.includes(expected)) throw new Error(`missing tool: ${expected}`);
+}
+const toolCardUri = 'ui://widget/codexpro-tool-card-v10.html';
+const toolsByName = new Map(tools.tools.map((tool) => [tool.name, tool]));
+function hasWidgetMeta(name) {
+  const meta = toolsByName.get(name)?._meta ?? {};
+  return meta.ui?.resourceUri === toolCardUri && meta['openai/outputTemplate'] === toolCardUri;
+}
+function hasToolCardStatusMeta(name) {
+  const meta = toolsByName.get(name)?._meta ?? {};
+  return Boolean(meta['openai/toolInvocation/invoking'] || meta['openai/toolInvocation/invoked']);
+}
+async function expectToolError(name, args, pattern, targetClient = client) {
+  const result = await targetClient.request('tools/call', { name, arguments: args });
+  if (!result.isError) {
+    throw new Error(`${name} unexpectedly succeeded`);
+  }
+  const text = result.content?.find?.((part) => part.type === 'text')?.text ?? JSON.stringify(result.structuredContent);
+  if (pattern && !pattern.test(text)) {
+    throw new Error(`${name} error did not match ${pattern}: ${text}`);
+  }
+}
+for (const visualTool of toolNames) {
+  if (hasWidgetMeta(visualTool) || hasToolCardStatusMeta(visualTool)) throw new Error(`${visualTool} exposed widget metadata while CODEXPRO_TOOL_CARDS is off`);
+}
+const cardClient = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--bash', 'safe', '--tool-mode', 'full'], {
+  cwd: path.resolve('.'),
+  env: { ...process.env, CODEXPRO_ROOT: tmp, CODEXPRO_ALLOWED_ROOTS: tmp, CODEXPRO_TOOL_CARDS: '1' }
+});
+await cardClient.request('initialize', {
+  protocolVersion: '2024-11-05',
+  capabilities: {},
+  clientInfo: { name: 'codexpro-smoke-card-opt-in', version: '0.1.0' }
+});
+cardClient.notify('notifications/initialized');
+const cardTools = await cardClient.request('tools/list', {});
+const cardRenderToolNames = new Set([
+  'open_current_workspace',
+  'open_workspace',
+  'workspace_snapshot',
+  'inspect_workspace',
+  'show_changes',
+  'git_status',
+  'handoff_to_agent',
+  'handoff_to_codex',
+  'bash'
+]);
+for (const tool of cardTools.tools) {
+  const meta = tool._meta ?? {};
+  const hasCard = meta.ui?.resourceUri === toolCardUri && meta['openai/outputTemplate'] === toolCardUri;
+  const hasStatus = Boolean(meta['openai/toolInvocation/invoking'] || meta['openai/toolInvocation/invoked']);
+  const shouldRenderCard = cardRenderToolNames.has(tool.name);
+  if (hasCard !== shouldRenderCard || hasStatus !== shouldRenderCard) {
+    throw new Error(`unexpected tool-card metadata for ${tool.name}: ${JSON.stringify(meta)}`);
+  }
+}
+const cardOpened = await cardClient.request('tools/call', { name: 'open_current_workspace', arguments: { include_tree: false } });
+const cardSearch = await cardClient.request('tools/call', {
+  name: 'search',
+  arguments: { workspace_id: cardOpened.structuredContent.workspace_id, query: 'read', path: 'demo.txt', max_results: 5 }
+});
+if ('text' in cardSearch.structuredContent) {
+  throw new Error(`raw search unexpectedly included card-only structured text: ${JSON.stringify(cardSearch.structuredContent)}`);
+}
+const cardInspect = await cardClient.request('tools/call', { name: 'inspect_workspace', arguments: { workspace_id: cardOpened.structuredContent.workspace_id } });
+if (cardInspect.structuredContent.codexpro_tool !== 'inspect_workspace' || !cardInspect.structuredContent.coverage) {
+  throw new Error(`inspect workspace card payload missing analysis: ${JSON.stringify(cardInspect.structuredContent)}`);
+}
+const cardStructuredSearch = await cardClient.request('tools/call', {
+  name: 'search',
+  arguments: { workspace_id: cardOpened.structuredContent.workspace_id, query: 'authenticate', path: 'src', intent: 'symbol', include_tests: true }
+});
+if (cardStructuredSearch.structuredContent.codexpro_tool !== 'search' || !cardStructuredSearch.structuredContent.analysis?.groups?.definitions?.length) {
+  throw new Error(`structured search card payload missing grouped analysis: ${JSON.stringify(cardStructuredSearch.structuredContent)}`);
+}
+if (spawnSync(process.platform === 'win32' ? 'where' : 'sh', process.platform === 'win32' ? ['rg'] : ['-lc', 'command -v rg >/dev/null 2>&1']).status === 0) {
+  const cardRegexSearch = await cardClient.request('tools/call', {
+    name: 'search',
+    arguments: { workspace_id: cardOpened.structuredContent.workspace_id, query: '(?i)READ', path: 'demo.txt', regex: true, max_results: 5 }
+  });
+  if (!cardRegexSearch.structuredContent.matches?.length || cardRegexSearch.structuredContent.used !== 'ripgrep') {
+    throw new Error(`ripgrep regex search did not accept rg syntax: ${JSON.stringify(cardRegexSearch.structuredContent)}`);
+  }
+}
+await cardClient.close();
+if (spawnSync(process.platform === 'win32' ? 'where' : 'sh', process.platform === 'win32' ? ['rg'] : ['-lc', 'command -v rg >/dev/null 2>&1']).status === 0) {
+  const limitedSearchClient = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--bash', 'off', '--tool-mode', 'standard'], {
+    cwd: path.resolve('.'),
+    env: {
+      ...process.env,
+      CODEXPRO_ROOT: tmp,
+      CODEXPRO_ALLOWED_ROOTS: tmp,
+      CODEXPRO_MAX_OUTPUT_BYTES: '4000'
+    }
+  });
+  try {
+    await limitedSearchClient.request('initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'codexpro-search-limit-smoke', version: '0.1.0' }
+    });
+    limitedSearchClient.notify('notifications/initialized');
+    const limitedOpened = await limitedSearchClient.request('tools/call', { name: 'open_current_workspace', arguments: { include_tree: false } });
+    const limitedSearch = await limitedSearchClient.request('tools/call', {
+      name: 'search',
+      arguments: {
+        workspace_id: limitedOpened.structuredContent.workspace_id,
+        query: 'overflow-marker',
+        path: 'search-overflow.txt',
+        max_results: 500
+      }
+    });
+    if (limitedSearch.isError || limitedSearch.structuredContent.truncated !== true) {
+      throw new Error(`ripgrep output limit did not return a bounded truncated result: ${JSON.stringify(limitedSearch.structuredContent)}`);
+    }
+    const afterLimitedSearch = await limitedSearchClient.request('tools/call', { name: 'server_config', arguments: {} });
+    if (afterLimitedSearch.isError || afterLimitedSearch.structuredContent.bashMode !== 'off') {
+      throw new Error('ripgrep output limit left the MCP server unavailable');
+    }
+  } finally {
+    await limitedSearchClient.close();
+  }
+}
+const resources = await client.request('resources/list', {});
+const toolCard = resources.resources.find((resource) => resource.uri === toolCardUri);
+if (!toolCard) throw new Error(`missing tool-card resource: ${toolCardUri}`);
+if (toolCard.mimeType !== 'text/html;profile=mcp-app') throw new Error(`unexpected tool-card mime type: ${toolCard.mimeType}`);
+const legacyToolCardUris = ['ui://widget/codexpro-tool-card-v9.html', 'ui://widget/codexpro-tool-card-v8.html'];
+for (const legacyToolCardUri of legacyToolCardUris) {
+  const legacyToolCard = resources.resources.find((resource) => resource.uri === legacyToolCardUri);
+  if (!legacyToolCard) throw new Error(`missing legacy tool-card resource: ${legacyToolCardUri}`);
+}
+const widget = await client.request('resources/read', { uri: toolCardUri });
+const widgetText = widget.contents?.[0]?.text ?? '';
+const widgetMeta = widget.contents?.[0]?._meta ?? {};
+for (const required of ['<meta charset="utf-8">', 'extractStructuredContent', 'renderWorkspace', 'renderWorkspaceAnalysis', 'renderChangeAnalysis', 'details class="fold"', 'ui/notifications/tool-result', 'copy-card-output', 'applyHostTheme', 'Result unavailable', 'Connected workspace', 'Verification completed']) {
+  if (!widgetText.includes(required)) throw new Error(`tool-card widget resource missing ${required}`);
+}
+if (widgetText.includes('Waiting for tool result') || widgetText.includes('codexpro-sheen')) {
+  throw new Error('tool-card widget retained the v9 loading treatment');
+}
+if (!widgetText.includes('renderBash')) {
+  throw new Error('tool-card widget resource did not include expected Apps bridge code');
+}
+if (!widgetMeta.ui?.csp || !widgetMeta['openai/widgetCSP']) {
+  throw new Error('tool-card widget resource did not expose standard and ChatGPT CSP metadata');
+}
+if (widgetMeta.ui?.domain !== 'https://widgets.codexpro.test' || widgetMeta['openai/widgetDomain'] !== 'https://widgets.codexpro.test') {
+  throw new Error('tool-card widget resource did not expose standard and ChatGPT widget domain metadata');
+}
+for (const legacyToolCardUri of legacyToolCardUris) {
+  const legacyWidget = await client.request('resources/read', { uri: legacyToolCardUri });
+  if (legacyWidget.contents?.[0]?.uri !== legacyToolCardUri) {
+    throw new Error('legacy tool-card widget resource did not preserve requested URI');
+  }
+  if (!(legacyWidget.contents?.[0]?.text ?? '').includes('Result unavailable')) {
+    throw new Error('legacy tool-card widget resource did not serve v10 HTML');
+  }
+}
+const current = await client.request('tools/call', { name: 'open_current_workspace', arguments: { include_tree: false } });
+const realTmp = await fs.realpath(tmp);
+const realOpenedRoot = await fs.realpath(current.structuredContent.root);
+if (realOpenedRoot.toLowerCase() !== realTmp.toLowerCase()) throw new Error(`open_current_workspace opened ${current.structuredContent.root}, expected ${realTmp}`);
+if (current.structuredContent.codexpro_tool !== 'open_current_workspace') throw new Error('tool result was not tagged for widget rendering');
+if (current.structuredContent.tool_mode !== 'full') throw new Error(`open_current_workspace did not expose tool_mode: ${current.structuredContent.tool_mode}`);
+if (current.structuredContent.skill_inventory?.length) {
+  throw new Error('open_current_workspace discovered skills by default');
+}
+const currentWithSkills = await client.request('tools/call', { name: 'open_current_workspace', arguments: { include_tree: false, include_skills: true } });
+const activeSmokeSkills = currentWithSkills.structuredContent.skill_inventory?.filter?.((skill) => skill.name === 'smoke-skill') ?? [];
+if (activeSmokeSkills.length !== 1 || activeSmokeSkills[0].source !== 'workspace') {
+  throw new Error(`open_current_workspace did not expose exactly one workspace smoke-skill: ${JSON.stringify(activeSmokeSkills)}`);
+}
+if (currentWithSkills.structuredContent.skill_inventory?.some?.((skill) => skill.name === 'outside-skill')) {
+  throw new Error('open_current_workspace followed a symlinked workspace skill root outside the workspace');
+}
+const alternate = await client.request('tools/call', {
+  name: 'open_workspace',
+  arguments: { root: alternateWorkspace, include_tree: false }
+});
+const selectedRead = await client.request('tools/call', {
+  name: 'read',
+  arguments: { path: 'selected.txt' }
+});
+const selectedText = selectedRead.content?.find?.((part) => part.type === 'text')?.text ?? '';
+if (!selectedText.includes('alternate workspace')) {
+  throw new Error(`read without workspace_id did not use selected workspace: ${selectedText}`);
+}
+const listedWorkspaces = await client.request('tools/call', { name: 'list_workspaces', arguments: {} });
+if (listedWorkspaces.structuredContent.selected_workspace_id !== alternate.structuredContent.workspace_id) {
+  throw new Error(`list_workspaces did not report selected workspace: ${JSON.stringify(listedWorkspaces.structuredContent)}`);
+}
+const resetCurrent = await client.request('tools/call', { name: 'open_current_workspace', arguments: { include_tree: false } });
+const resetRead = await client.request('tools/call', { name: 'read', arguments: { path: 'demo.txt' } });
+const resetText = resetRead.content?.find?.((part) => part.type === 'text')?.text ?? '';
+if (resetCurrent.structuredContent.workspace_id !== current.structuredContent.workspace_id || !resetText.includes('omega')) {
+  throw new Error('open_current_workspace did not restore the launch workspace selection');
+}
+const selfTest = await client.request('tools/call', {
+  name: 'codexpro_self_test',
+  arguments: {
+    workspace_id: current.structuredContent.workspace_id,
+    max_skills: 12
+  }
+});
+if (selfTest.structuredContent.status === 'fail' || !selfTest.structuredContent.expected_tools?.includes?.('codexpro_self_test')) {
+  throw new Error(`codexpro_self_test failed: ${JSON.stringify(selfTest.structuredContent)}`);
+}
+if (JSON.stringify([...(selfTest.structuredContent.expected_tools ?? [])].sort()) !== JSON.stringify([...(selfTest.structuredContent.registered_tools ?? [])].sort())) {
+  throw new Error(`codexpro_self_test expected/registered tools mismatch: ${JSON.stringify(selfTest.structuredContent)}`);
+}
+if (!selfTest.structuredContent.files_touched?.includes?.('.ai-bridge/codexpro-self-test.md')) {
+  throw new Error('codexpro_self_test did not run the .ai-bridge write/edit probe');
+}
+const snapshotAlias = await client.request('tools/call', {
+  name: 'workspace_snapshot',
+  arguments: {
+    workspace_id: current.structuredContent.workspace_id,
+    max_depth: 1,
+    max_files: 20,
+    include_skills: false
+  }
+});
+if (!snapshotAlias.structuredContent.tree) {
+  throw new Error('workspace_snapshot did not accept max_files alias or return a tree');
+}
+const loadedSkill = await client.request('tools/call', {
+  name: 'load_skill',
+  arguments: { name: 'smoke-skill' }
+});
+if (loadedSkill.structuredContent.skill?.source !== 'workspace' || !loadedSkill.structuredContent.text?.includes('# Smoke Skill')) {
+  throw new Error('load_skill did not return bounded SKILL.md content for smoke-skill');
+}
+const suppressedSkill = await client.request('tools/call', {
+  name: 'load_skill',
+  arguments: {
+    name: 'smoke-skill',
+    path: '$WORKSPACE/.agents/skills/smoke-skill/SKILL.md'
+  }
+});
+if (!suppressedSkill.structuredContent.text?.includes('# Duplicate Smoke Skill')) {
+  throw new Error('load_skill path override did not load the suppressed workspace duplicate');
+}
+await expectToolError('load_skill', { name: 'missing-skill' }, /Skill not found/);
+await expectToolError('load_skill', { name: 'outside-skill', source: 'workspace', include_global_skills: false }, /Skill not found/);
+const inventory = await client.request('tools/call', { name: 'codexpro_inventory', arguments: { include_global_skills: false, include_mcp_servers: false } });
+if (inventory.structuredContent.codexpro_tool !== 'codexpro_inventory') throw new Error('inventory result was not tagged for widget rendering');
+const opened = await client.request('tools/call', { name: 'open_workspace', arguments: { root: tmp, include_tree: true } });
+const ws = opened.structuredContent.workspace_id;
+const viewedImage = await client.request('tools/call', { name: 'view_image', arguments: { workspace_id: ws, path: 'pixel.png' } });
+const imagePart = viewedImage.content?.find?.((part) => part.type === 'image');
+if (!imagePart?.data || imagePart.mimeType !== 'image/png' || viewedImage.structuredContent.width !== 1 || viewedImage.structuredContent.height !== 1) {
+  throw new Error(`view_image did not return native PNG content: ${JSON.stringify(viewedImage.structuredContent)}`);
+}
+await expectToolError('view_image', { workspace_id: ws, path: 'demo.txt' }, /Unsupported image format/);
+const workspaceAnalysis = await client.request('tools/call', { name: 'inspect_workspace', arguments: { workspace_id: ws } });
+if (!workspaceAnalysis.structuredContent.languages?.includes('typescript') || !workspaceAnalysis.structuredContent.coverage) {
+  throw new Error(`inspect_workspace omitted analysis: ${JSON.stringify(workspaceAnalysis.structuredContent)}`);
+}
+const legacySearch = await client.request('tools/call', { name: 'search', arguments: { workspace_id: ws, query: 'authenticate', path: 'src' } });
+for (const key of ['matches', 'truncated', 'used']) {
+  if (!(key in legacySearch.structuredContent)) throw new Error(`legacy search lost ${key}`);
+}
+if ('analysis' in legacySearch.structuredContent) throw new Error('legacy search unexpectedly paid the structured-analysis cost');
+const structuredSearch = await client.request('tools/call', {
+  name: 'search',
+  arguments: { workspace_id: ws, query: 'authenticate', path: 'src', intent: 'symbol', include_tests: true }
+});
+if (!structuredSearch.structuredContent.analysis?.groups?.definitions?.length || !structuredSearch.structuredContent.analysis.groups.tests?.length) {
+  throw new Error(`structured search omitted grouped analysis: ${JSON.stringify(structuredSearch.structuredContent)}`);
+}
+const openedByPath = await client.request('tools/call', { name: 'open_workspace', arguments: { path: tmp, include_tree: false } });
+if (openedByPath.structuredContent.workspace_id !== ws) {
+  throw new Error(`open_workspace path alias returned ${openedByPath.structuredContent.workspace_id}, expected ${ws}`);
+}
+await client.request('tools/call', { name: 'read', arguments: { workspace_id: ws, path: 'demo.txt' } });
+await fs.writeFile(path.join(tmp, 'tokens.txt'), [
+  'Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz123456',
+  'https://example.test/mcp?codexpro_token=verysecretcodexprotoken123&x=1',
+  'codexpro_token=secretsecret12345',
+  '"codexpro_token": "shortcodextoken"',
+  'ANTHROPIC_API_KEY=sk-ant-abcdefghijklmnopqrstuvwxyz123456',
+  '"api_key": "jsonsecretvalueabcdefghijklmnop"',
+  'service_token: yamlsecretvalueabcdefghijklmnop',
+  'ngrok config add-authtoken 2abcDEFghiJKLmnopQRSTuvWXyz_1234567890',
+  'cloudflared tunnel run --token eyJhbGciOiJIUzI1NiJ9.eyJ0dW5uZWwiOiJjb2RleHBybyJ9.signature1234567890',
+  'cloudflared tunnel run --token-file /Users/rebel/.codexpro/cloudflare-tunnel-token'
+].join('\n'), 'utf8');
+const secretRead = await client.request('tools/call', { name: 'read', arguments: { workspace_id: ws, path: 'config.txt' } });
+const secretPayload = JSON.stringify(secretRead);
+if (secretPayload.includes('sk-realSecretValue123') || !secretPayload.includes('[REDACTED_SECRET]')) {
+  throw new Error('read did not redact secret-looking content');
+}
+const tokenRead = await client.request('tools/call', { name: 'read', arguments: { workspace_id: ws, path: 'tokens.txt' } });
+const tokenPayload = JSON.stringify(tokenRead);
+for (const leaked of ['ghp_abcdefghijklmnopqrstuvwxyz123456', 'verysecretcodexprotoken123', 'secretsecret12345', 'shortcodextoken', 'sk-ant-abcdefghijklmnopqrstuvwxyz123456', 'jsonsecretvalueabcdefghijklmnop', 'yamlsecretvalueabcdefghijklmnop', '2abcDEFghiJKLmnopQRSTuvWXyz_1234567890', 'eyJhbGciOiJIUzI1NiJ9.eyJ0dW5uZWwiOiJjb2RleHBybyJ9.signature1234567890']) {
+  if (tokenPayload.includes(leaked)) throw new Error(`read leaked token-like content: ${leaked}`);
+}
+if (!tokenPayload.includes('/Users/rebel/.codexpro/cloudflare-tunnel-token')) {
+  throw new Error('redaction hid a non-secret Cloudflare token-file path');
+}
+await expectToolError('write', { workspace_id: ws, path: 'notes.md', content: 'OPENAI_API_KEY=sk-realSecretValue123\n' }, /Secret-looking content is blocked/);
+await expectToolError('write', { workspace_id: ws, path: 'token.txt', content: 'codexpro_token=shorttok\n' }, /Secret-looking content is blocked/);
+await expectToolError('write', { workspace_id: ws, path: 'notes.yaml', content: 'api_key: yamlsecretvalueabcdefghijklmnop\n' }, /Secret-looking content is blocked/);
+await client.request('tools/call', {
+  name: 'write',
+  arguments: {
+    workspace_id: ws,
+    path: 'env-ref.js',
+    content: 'const TOKEN = process.env.TOKEN;\nconst OPENAI_API_KEY = process.env.OPENAI_API_KEY;\nconst apiToken = getToken();\n'
+  }
+});
+const inspectAfterWrite = await client.request('tools/call', { name: 'inspect_workspace', arguments: { workspace_id: ws } });
+if (inspectAfterWrite.structuredContent.cache?.hit !== false || !inspectAfterWrite.structuredContent.files?.some((file) => file.path === 'env-ref.js')) {
+  throw new Error(`write did not invalidate workspace analysis: ${JSON.stringify(inspectAfterWrite.structuredContent.cache)}`);
+}
+const envRefRead = await client.request('tools/call', { name: 'read', arguments: { workspace_id: ws, path: 'env-ref.js' } });
+const envRefPayload = JSON.stringify(envRefRead);
+if (envRefPayload.includes('[REDACTED_SECRET]')) {
+  throw new Error('env-var token references were incorrectly redacted as literal secrets');
+}
+await fs.writeFile(path.join(tmp, 'concurrent.txt'), 'version one\n', 'utf8');
+const concurrentRead = await client.request('tools/call', { name: 'read', arguments: { workspace_id: ws, path: 'concurrent.txt' } });
+await fs.writeFile(path.join(tmp, 'concurrent.txt'), 'version two\n', 'utf8');
+await expectToolError('write', {
+  workspace_id: ws,
+  path: 'concurrent.txt',
+  content: 'stale overwrite\n',
+  expected_sha256: concurrentRead.structuredContent.sha256
+}, /File changed since it was read/);
+const concurrentFresh = await client.request('tools/call', { name: 'read', arguments: { workspace_id: ws, path: 'concurrent.txt' } });
+await client.request('tools/call', {
+  name: 'edit',
+  arguments: {
+    workspace_id: ws,
+    path: 'concurrent.txt',
+    old_text: 'version two',
+    new_text: 'version three',
+    expected_sha256: concurrentFresh.structuredContent.sha256
+  }
+});
+if (await fs.readFile(path.join(tmp, 'concurrent.txt'), 'utf8') !== 'version three\n') {
+  throw new Error('conflict-safe edit did not update the file');
+}
+for (let attempt = 0; attempt < 12; attempt += 1) {
+  const original = `race original ${attempt}\n`;
+  await fs.writeFile(path.join(tmp, 'race.txt'), original, 'utf8');
+  const raceRead = await client.request('tools/call', { name: 'read', arguments: { workspace_id: ws, path: 'race.txt' } });
+  const raceResults = await Promise.all([
+    client.request('tools/call', {
+      name: 'edit',
+      arguments: {
+        workspace_id: ws,
+        path: 'race.txt',
+        old_text: original.trim(),
+        new_text: `race winner a ${attempt}`,
+        expected_sha256: raceRead.structuredContent.sha256
+      }
+    }),
+    client.request('tools/call', {
+      name: 'edit',
+      arguments: {
+        workspace_id: ws,
+        path: 'race.txt',
+        old_text: original.trim(),
+        new_text: `race winner b ${attempt}`,
+        expected_sha256: raceRead.structuredContent.sha256
+      }
+    })
+  ]);
+  const raceSuccesses = raceResults.filter((result) => !result.isError);
+  const raceFailures = raceResults.filter((result) => result.isError);
+  if (raceSuccesses.length !== 1 || raceFailures.length !== 1) {
+    throw new Error(`expected exactly one concurrent SHA edit to succeed: ${JSON.stringify(raceResults)}`);
+  }
+  const raceFailureText = raceFailures[0].content?.find?.((part) => part.type === 'text')?.text ?? '';
+  if (!/File changed since it was read/.test(raceFailureText)) {
+    throw new Error(`concurrent SHA edit failed for the wrong reason: ${raceFailureText}`);
+  }
+}
+for (let attempt = 0; attempt < 12; attempt += 1) {
+  const original = `patch race original ${attempt}\n`;
+  const edited = `patch race edit winner ${attempt}\n`;
+  const patched = `patch race patch winner ${attempt}\n`;
+  await fs.writeFile(path.join(tmp, 'patch-race.txt'), original, 'utf8');
+  const raceRead = await client.request('tools/call', {
+    name: 'read',
+    arguments: { workspace_id: ws, path: 'patch-race.txt' }
+  });
+  const patch = [
+    'diff --git a/patch-race.txt b/patch-race.txt',
+    '--- a/patch-race.txt',
+    '+++ b/patch-race.txt',
+    '@@ -1 +1 @@',
+    `-${original.trimEnd()}`,
+    `+${patched.trimEnd()}`
+  ].join('\n') + '\n';
+  const raceResults = await Promise.all([
+    client.request('tools/call', {
+      name: 'edit',
+      arguments: {
+        workspace_id: ws,
+        path: 'patch-race.txt',
+        old_text: original.trimEnd(),
+        new_text: edited.trimEnd(),
+        expected_sha256: raceRead.structuredContent.sha256
+      }
+    }),
+    client.request('tools/call', {
+      name: 'apply_patch',
+      arguments: { workspace_id: ws, patch }
+    })
+  ]);
+  if (raceResults.filter((result) => !result.isError).length !== 1 || raceResults.filter((result) => result.isError).length !== 1) {
+    throw new Error(`apply_patch did not share the per-file write lock: ${JSON.stringify(raceResults)}`);
+  }
+  const finalText = await fs.readFile(path.join(tmp, 'patch-race.txt'), 'utf8');
+  const normalizedFinalText = finalText.replaceAll('\r\n', '\n');
+  if (normalizedFinalText !== edited && normalizedFinalText !== patched) {
+    throw new Error(`apply_patch race produced a lost or partial update: ${JSON.stringify(finalText)}`);
+  }
+}
+if (process.platform !== 'win32') {
+  const canonicalDir = path.join(tmp, 'canonical-lock-target');
+  const canonicalAlias = path.join(tmp, 'canonical-lock-alias');
+  await fs.mkdir(canonicalDir, { recursive: true });
+  await fs.writeFile(path.join(canonicalDir, 'shared.txt'), 'canonical original\n', 'utf8');
+  await fs.symlink(canonicalDir, canonicalAlias, 'dir');
+  const canonicalRead = await client.request('tools/call', {
+    name: 'read',
+    arguments: { workspace_id: ws, path: 'canonical-lock-target/shared.txt' }
+  });
+  const canonicalRace = await Promise.all([
+    client.request('tools/call', {
+      name: 'edit',
+      arguments: {
+        workspace_id: ws,
+        path: 'canonical-lock-target/shared.txt',
+        old_text: 'canonical original',
+        new_text: 'canonical direct winner',
+        expected_sha256: canonicalRead.structuredContent.sha256
+      }
+    }),
+    client.request('tools/call', {
+      name: 'edit',
+      arguments: {
+        workspace_id: ws,
+        path: 'canonical-lock-alias/shared.txt',
+        old_text: 'canonical original',
+        new_text: 'canonical alias winner',
+        expected_sha256: canonicalRead.structuredContent.sha256
+      }
+    })
+  ]);
+  if (canonicalRace.filter((result) => !result.isError).length !== 1 || canonicalRace.filter((result) => result.isError).length !== 1) {
+    throw new Error(`canonical-path write lock did not serialize aliases: ${JSON.stringify(canonicalRace)}`);
+  }
+}
+if (process.platform !== 'win32') {
+  const permissionPath = path.join(tmp, 'permissions.txt');
+  const hardLinkPath = path.join(tmp, 'permissions-hard-link.txt');
+  await fs.writeFile(permissionPath, 'permission before\n', 'utf8');
+  await fs.chmod(permissionPath, 0o666);
+  await fs.link(permissionPath, hardLinkPath);
+  const initialStat = await fs.stat(permissionPath);
+  const permissionRead = await client.request('tools/call', { name: 'read', arguments: { workspace_id: ws, path: 'permissions.txt' } });
+  await client.request('tools/call', {
+    name: 'edit',
+    arguments: {
+      workspace_id: ws,
+      path: 'permissions.txt',
+      old_text: 'permission before',
+      new_text: 'permission after',
+      expected_sha256: permissionRead.structuredContent.sha256
+    }
+  });
+  const finalStat = await fs.stat(permissionPath);
+  const finalMode = finalStat.mode & 0o7777;
+  if (finalMode !== 0o666) {
+    throw new Error(`edit changed existing permissions from 0666 to ${finalMode.toString(8)}`);
+  }
+  if (finalStat.ino !== initialStat.ino) {
+    throw new Error(`edit replaced the existing inode ${initialStat.ino} with ${finalStat.ino}`);
+  }
+  if (await fs.readFile(hardLinkPath, 'utf8') !== 'permission after\n') {
+    throw new Error('edit broke existing hard-link identity');
+  }
+}
+const symlinkRead = await client.request('tools/call', { name: 'read', arguments: { workspace_id: ws, path: symlinkEscapePath } });
+if (!symlinkRead.isError) throw new Error('symlink escape read was not blocked');
+for (const linkPath of danglingSymlinks) {
+  await expectToolError('write', { workspace_id: ws, path: linkPath, content: 'escaped write\n' }, /symlink/i);
+}
+await client.request('tools/call', { name: 'edit', arguments: { workspace_id: ws, path: 'demo.txt', old_text: 'read\nread', new_text: 'read\nwrite' } });
+await client.request('tools/call', { name: 'edit', arguments: { workspace_id: ws, path: 'src/auth.ts', old_text: 'return Boolean(user);', new_text: 'return Boolean(user?.trim());' } });
+const inspectAfterEdit = await client.request('tools/call', { name: 'inspect_workspace', arguments: { workspace_id: ws } });
+if (inspectAfterEdit.structuredContent.cache?.hit !== false) {
+  throw new Error(`edit did not invalidate workspace analysis: ${JSON.stringify(inspectAfterEdit.structuredContent.cache)}`);
+}
+const changes = await client.request('tools/call', { name: 'show_changes', arguments: { workspace_id: ws } });
+if (!changes.structuredContent.changed || !changes.structuredContent.diff.includes('demo.txt')) {
+  throw new Error('show_changes did not report the edited demo.txt diff');
+}
+if (!changes.structuredContent.analysis?.risk_signals?.some((risk) => risk.id === 'authentication')) {
+  throw new Error(`show_changes omitted authentication risk analysis: ${JSON.stringify(changes.structuredContent.analysis)}`);
+}
+if (!changes.structuredContent.analysis?.related_tests?.some((file) => file.path === 'test/auth.test.ts')) {
+  throw new Error(`show_changes omitted related auth test: ${JSON.stringify(changes.structuredContent.analysis)}`);
+}
+if (!changes.structuredContent.analysis?.recommended_commands?.some((item) => item.command === 'npm test')) {
+  throw new Error(`show_changes omitted existing npm test recommendation: ${JSON.stringify(changes.structuredContent.analysis)}`);
+}
+const repeatedChanges = await client.request('tools/call', { name: 'show_changes', arguments: { workspace_id: ws } });
+if (repeatedChanges.structuredContent.changed || repeatedChanges.structuredContent.diff || repeatedChanges.structuredContent.review_checkpoint_hit !== true || repeatedChanges.structuredContent.additions !== 0 || repeatedChanges.structuredContent.deletions !== 0) {
+  throw new Error(`show_changes repeated the same review instead of using the last-shown checkpoint: ${JSON.stringify(repeatedChanges.structuredContent)}`);
+}
+if ('analysis' in repeatedChanges.structuredContent) {
+  throw new Error(`show_changes recomputed analysis for an unchanged checkpoint: ${JSON.stringify(repeatedChanges.structuredContent.analysis)}`);
+}
+await client.request('tools/call', { name: 'edit', arguments: { workspace_id: ws, path: 'other.txt', old_text: 'keep', new_text: 'unrelated dirty file' } });
+const patchResult = await client.request('tools/call', {
+  name: 'apply_patch',
+  arguments: {
+    workspace_id: ws,
+    patch: [
+      'diff --git a/demo.txt b/demo.txt',
+      'index f41f61c..be6d0ff 100644',
+      '--- a/demo.txt',
+      '+++ b/demo.txt',
+      '@@ -1,4 +1,4 @@',
+      ' alpha',
+      ' read',
+      ' write',
+      '-omega',
+      '+omega patched'
+    ].join('\n') + '\n'
+  }
+});
+if (!patchResult.structuredContent.changed || !patchResult.structuredContent.paths?.includes?.('demo.txt')) {
+  throw new Error(`apply_patch did not report the patched file: ${JSON.stringify(patchResult.structuredContent)}`);
+}
+if (patchResult.structuredContent.diff?.includes?.('other.txt')) {
+  throw new Error(`apply_patch leaked unrelated workspace diff: ${patchResult.structuredContent.diff}`);
+}
+const inspectAfterPatch = await client.request('tools/call', { name: 'inspect_workspace', arguments: { workspace_id: ws } });
+if (inspectAfterPatch.structuredContent.cache?.hit !== false) {
+  throw new Error(`apply_patch did not invalidate workspace analysis: ${JSON.stringify(inspectAfterPatch.structuredContent.cache)}`);
+}
+const patchedRead = await client.request('tools/call', { name: 'read', arguments: { workspace_id: ws, path: 'demo.txt' } });
+if (!patchedRead.content?.[0]?.text?.includes('omega patched')) {
+  throw new Error(`apply_patch did not update demo.txt: ${patchedRead.content?.[0]?.text}`);
+}
+await expectToolError('apply_patch', {
+  workspace_id: ws,
+  patch: [
+    'diff --git a/.env b/.env',
+    'new file mode 100644',
+    'index 0000000..e69de29',
+    '--- /dev/null',
+    '+++ b/.env',
+    '@@ -0,0 +1 @@',
+    '+SAFE_PLACEHOLDER=1'
+  ].join('\n') + '\n'
+}, /blocked/i);
+await expectToolError('apply_patch', {
+  workspace_id: ws,
+  patch: [
+    'diff --git old/.env new/.env',
+    'new file mode 100644',
+    'index 0000000..e69de29',
+    '--- /dev/null',
+    '+++ new/.env',
+    '@@ -0,0 +1 @@',
+    '+SAFE_PLACEHOLDER=1'
+  ].join('\n') + '\n'
+}, /blocked/i);
+await expectToolError('apply_patch', {
+  workspace_id: ws,
+  patch: [
+    'diff --git "a/foo\\057.env" "b/foo\\057.env"',
+    'new file mode 100644',
+    'index 0000000..e69de29',
+    '--- /dev/null',
+    '+++ "b/foo\\057.env"',
+    '@@ -0,0 +1 @@',
+    '+SAFE_PLACEHOLDER=1'
+  ].join('\n') + '\n'
+}, /blocked/i);
+await expectToolError('apply_patch', {
+  workspace_id: ws,
+  patch: [
+    'diff --git a/demo.txt b/demo.txt',
+    'index be6d0ff..f4aa735 100644',
+    '--- a/demo.txt',
+    '+++ b/demo.txt',
+    '@@ -1,4 +1,4 @@',
+    ' alpha',
+    ' read',
+    ' write',
+    '-omega patched',
+    '+omega copied',
+    'diff --git a/demo.txt b/.env',
+    'similarity index 100%',
+    'copy from demo.txt',
+    'copy to .env'
+  ].join('\n') + '\n'
+}, /blocked/i);
+await expectToolError('apply_patch', {
+  workspace_id: ws,
+  patch: [
+    'diff --git a/link-outside b/link-outside',
+    'new file mode 120000 ',
+    'index 0000000..2e65efe',
+    '--- /dev/null',
+    '+++ b/link-outside',
+    '@@ -0,0 +1 @@',
+    '+/tmp/outside-target'
+  ].join('\n') + '\n'
+}, /symlink/i);
+const postPatchChanges = await client.request('tools/call', { name: 'show_changes', arguments: { workspace_id: ws } });
+if (!postPatchChanges.structuredContent.changed || !postPatchChanges.structuredContent.diff.includes('omega patched')) {
+  throw new Error(`show_changes did not report new patch changes after checkpoint: ${JSON.stringify(postPatchChanges.structuredContent)}`);
+}
+const statsOnlyDiff = await client.request('tools/call', { name: 'git_diff', arguments: { workspace_id: ws, include_diff: false } });
+if (statsOnlyDiff.structuredContent.include_diff !== false || statsOnlyDiff.structuredContent.diff !== '') {
+  throw new Error(`git_diff include_diff=false returned raw diff: ${JSON.stringify(statsOnlyDiff.structuredContent)}`);
+}
+if (!statsOnlyDiff.content?.[0]?.text?.includes('Raw diff omitted by include_diff=false')) {
+  throw new Error('git_diff include_diff=false did not report omitted diff in text output');
+}
+const statsOnlyChanges = await client.request('tools/call', { name: 'show_changes', arguments: { workspace_id: ws, path: 'other.txt', include_diff: false } });
+if (!statsOnlyChanges.structuredContent.changed || statsOnlyChanges.structuredContent.diff !== '') {
+  throw new Error(`show_changes include_diff=false should keep stats and omit diff: ${JSON.stringify(statsOnlyChanges.structuredContent)}`);
+}
+const fullChangesAfterStatsOnly = await client.request('tools/call', { name: 'show_changes', arguments: { workspace_id: ws, path: './other.txt' } });
+if (!fullChangesAfterStatsOnly.structuredContent.changed || fullChangesAfterStatsOnly.structuredContent.review_checkpoint_hit || !fullChangesAfterStatsOnly.structuredContent.diff.includes('other.txt')) {
+  throw new Error(`show_changes include_diff=false consumed the next full diff: ${JSON.stringify(fullChangesAfterStatsOnly.structuredContent)}`);
+}
+const statsOnlyAfterCheckpoint = await client.request('tools/call', { name: 'show_changes', arguments: { workspace_id: ws, path: 'other.txt', include_diff: false } });
+if (!statsOnlyAfterCheckpoint.structuredContent.changed || statsOnlyAfterCheckpoint.structuredContent.diff !== '' || statsOnlyAfterCheckpoint.structuredContent.additions !== 1) {
+  throw new Error(`show_changes include_diff=false lost stats after checkpoint: ${JSON.stringify(statsOnlyAfterCheckpoint.structuredContent)}`);
+}
+if (statsOnlyAfterCheckpoint.structuredContent.review_marked) {
+  throw new Error(`show_changes include_diff=false claimed it updated the review checkpoint: ${JSON.stringify(statsOnlyAfterCheckpoint.structuredContent)}`);
+}
+const demoChanges = await client.request('tools/call', { name: 'show_changes', arguments: { workspace_id: ws, path: 'demo.txt' } });
+if (!demoChanges.structuredContent.changed || !demoChanges.structuredContent.changed_files?.some?.((line) => line.includes('demo.txt'))) {
+  throw new Error(`path-scoped show_changes did not report demo.txt: ${JSON.stringify(demoChanges.structuredContent.changed_files)}`);
+}
+if (demoChanges.structuredContent.changed_files?.some?.((line) => line.includes('env-ref.js'))) {
+  throw new Error(`path-scoped show_changes leaked unrelated env-ref.js status: ${JSON.stringify(demoChanges.structuredContent.changed_files)}`);
+}
+if (JSON.stringify(demoChanges.structuredContent.analysis?.changed_paths) !== JSON.stringify(['demo.txt'])) {
+  throw new Error(`path-scoped show_changes leaked unrelated analysis: ${JSON.stringify(demoChanges.structuredContent.analysis)}`);
+}
+await fs.writeFile(path.join(tmp, 'é.ts'), 'export const accent = 2;\n', 'utf8');
+const utf8Changes = await client.request('tools/call', { name: 'show_changes', arguments: { workspace_id: ws, path: 'é.ts', since: 'workspace' } });
+if (JSON.stringify(utf8Changes.structuredContent.analysis?.changed_paths) !== JSON.stringify(['é.ts'])) {
+  throw new Error(`show_changes did not decode a Git-quoted UTF-8 path: ${JSON.stringify(utf8Changes.structuredContent.analysis)}`);
+}
+const renameResult = spawnSync('git', ['mv', '旧名.ts', '新名.ts'], { cwd: tmp, encoding: 'utf8' });
+if (renameResult.status !== 0) throw new Error(`git mv UTF-8 path failed: ${renameResult.stderr || renameResult.stdout}`);
+const utf8RenameChanges = await client.request('tools/call', { name: 'show_changes', arguments: { workspace_id: ws, staged: true, since: 'workspace' } });
+if (!utf8RenameChanges.structuredContent.analysis?.changed_paths?.includes?.('新名.ts')) {
+  throw new Error(`show_changes did not decode a Git-quoted UTF-8 rename: ${JSON.stringify(utf8RenameChanges.structuredContent.analysis)}`);
+}
+const restoreRenameResult = spawnSync('git', ['mv', '新名.ts', '旧名.ts'], { cwd: tmp, encoding: 'utf8' });
+if (restoreRenameResult.status !== 0) throw new Error(`git mv UTF-8 fixture restore failed: ${restoreRenameResult.stderr || restoreRenameResult.stdout}`);
+const cleanPathChanges = await client.request('tools/call', { name: 'show_changes', arguments: { workspace_id: ws, path: 'package.json' } });
+if (cleanPathChanges.structuredContent.changed || cleanPathChanges.structuredContent.changed_files?.length || cleanPathChanges.structuredContent.diff.includes('demo.txt')) {
+  throw new Error(`path-scoped show_changes leaked unrelated changes: ${JSON.stringify(cleanPathChanges.structuredContent)}`);
+}
+await fs.writeFile(path.join(tmp, 'staged-only.txt'), 'ready\n', 'utf8');
+const stageOnlyResult = spawnSync('git', ['add', 'staged-only.txt'], { cwd: tmp, encoding: 'utf8' });
+if (stageOnlyResult.status !== 0) throw new Error(`git add staged-only.txt failed: ${stageOnlyResult.stderr || stageOnlyResult.stdout}`);
+await fs.writeFile(path.join(tmp, 'unstaged-only.txt'), 'dirty\n', 'utf8');
+const defaultStagedPathChanges = await client.request('tools/call', { name: 'show_changes', arguments: { workspace_id: ws, path: 'staged-only.txt' } });
+if (defaultStagedPathChanges.structuredContent.changed || defaultStagedPathChanges.structuredContent.diff || defaultStagedPathChanges.structuredContent.additions !== 0) {
+  throw new Error(`default show_changes reported staged-only changes as unstaged: ${JSON.stringify(defaultStagedPathChanges.structuredContent)}`);
+}
+const stagedChanges = await client.request('tools/call', { name: 'show_changes', arguments: { workspace_id: ws, staged: true } });
+if (!stagedChanges.structuredContent.changed || !stagedChanges.structuredContent.diff.includes('staged-only.txt') || stagedChanges.structuredContent.diff.includes('unstaged-only.txt')) {
+  throw new Error(`staged show_changes mixed staged and unstaged files: ${JSON.stringify(stagedChanges.structuredContent)}`);
+}
+if (JSON.stringify(stagedChanges.structuredContent.analysis?.changed_paths) !== JSON.stringify(['staged-only.txt'])) {
+  throw new Error(`staged show_changes mixed analysis paths: ${JSON.stringify(stagedChanges.structuredContent.analysis)}`);
+}
+await client.request('tools/call', { name: 'write', arguments: { workspace_id: ws, path: 'new-review.txt', content: 'new file\n' } });
+const untrackedChanges = await client.request('tools/call', { name: 'show_changes', arguments: { workspace_id: ws, path: 'new-review.txt' } });
+if (!untrackedChanges.structuredContent.changed || !untrackedChanges.structuredContent.changed_files?.some?.((line) => line.includes('new-review.txt'))) {
+  throw new Error(`show_changes did not report untracked new file: ${JSON.stringify(untrackedChanges.structuredContent)}`);
+}
+await fs.writeFile(path.join(tmp, 'new-review.txt'), 'new file changed\n', 'utf8');
+const changedUntrackedChanges = await client.request('tools/call', { name: 'show_changes', arguments: { workspace_id: ws, path: 'new-review.txt' } });
+if (!changedUntrackedChanges.structuredContent.changed || changedUntrackedChanges.structuredContent.review_checkpoint_hit) {
+  throw new Error(`show_changes checkpoint hid changed untracked file content: ${JSON.stringify(changedUntrackedChanges.structuredContent)}`);
+}
+const codexContext = await client.request('tools/call', { name: 'codex_context', arguments: { workspace_id: ws, target_path: 'demo.txt' } });
+if (!codexContext.structuredContent.agents_files.includes('AGENTS.md')) throw new Error('codex_context did not include AGENTS.md');
+if (codexContext.structuredContent.agents_files.length !== 1) throw new Error(`codex_context returned duplicate AGENTS files: ${codexContext.structuredContent.agents_files.join(', ')}`);
+if (!codexContext.content?.[0]?.text?.includes('Smoke Agents')) throw new Error('codex_context did not include AGENTS.md content');
+const pwdBash = await client.request('tools/call', { name: 'bash', arguments: { workspace_id: ws, command: 'pwd' } });
+const pwdBashText = pwdBash.content?.[0]?.text ?? '';
+if (!pwdBashText.includes('Exit: 0') || pwdBashText.includes('## stdout') || pwdBashText.includes('## stderr')) {
+  throw new Error(`default bash transcript should be compact: ${pwdBashText}`);
+}
+const normalizedPwd = (pwdBash.structuredContent.stdout ?? '').trim().replaceAll('\\', '/').toLowerCase();
+const expectedPwdLeaf = path.basename(tmp).toLowerCase();
+if (!normalizedPwd.endsWith(`/${expectedPwdLeaf}`)) {
+  throw new Error(`compact bash transcript dropped structured stdout: ${JSON.stringify(pwdBash.structuredContent)}`);
+}
+await expectToolError('bash', { workspace_id: ws, command: 'find /tmp' }, /blocked/i);
+await expectToolError('bash', { workspace_id: ws, command: 'find . -fprint leaked.txt' }, /blocked/i);
+await expectToolError('bash', { workspace_id: ws, command: 'git show HEAD:.env' }, /blocked/i);
+await expectToolError('bash', { workspace_id: ws, command: 'ls $HOME' }, /blocked/i);
+const clientBuild = await client.request('tools/call', { name: 'bash', arguments: { workspace_id: ws, command: 'npm run build:clients', timeout_ms: 60000 } });
+if (!clientBuild.structuredContent.stdout?.includes('clients ok')) {
+  throw new Error('safe bash did not run npm run build:clients');
+}
+const exported = await client.request('tools/call', { name: 'export_pro_context', arguments: { workspace_id: ws, selected_paths: ['demo.txt'], max_files: 4, max_total_bytes: 80000 } });
+if (exported.structuredContent.path !== '.ai-bridge/pro-context.md') throw new Error('export_pro_context wrote an unexpected path');
+if (!exported.structuredContent.files_included?.includes('demo.txt')) {
+  throw new Error(`export_pro_context dropped an explicit selected path: ${JSON.stringify(exported.structuredContent.files_included)}`);
+}
+await fs.stat(path.join(tmp, '.ai-bridge', 'pro-context.md'));
+const oneFileExport = await client.request('tools/call', {
+  name: 'export_pro_context',
+  arguments: {
+    workspace_id: ws,
+    selected_paths: ['demo.txt'],
+    max_files: 1,
+    max_total_bytes: 80000
+  }
+});
+if (JSON.stringify(oneFileExport.structuredContent.files_included) !== JSON.stringify(['demo.txt'])) {
+  throw new Error(`export_pro_context did not prioritize selected path with max_files=1: ${JSON.stringify(oneFileExport.structuredContent.files_included)}`);
+}
+const exactExport = await client.request('tools/call', {
+  name: 'export_pro_context',
+  arguments: {
+    workspace_id: ws,
+    selected_paths: ['demo.txt'],
+    include_important_files: false,
+    include_changed_files: false,
+    include_diff: false,
+    include_ai_bridge: false,
+    max_files: 4,
+    max_total_bytes: 80000
+  }
+});
+if (!exactExport.structuredContent.files_included?.includes('demo.txt')) {
+  throw new Error(`selected-only export did not include demo.txt: ${JSON.stringify(exactExport.structuredContent.files_included)}`);
+}
+if (exactExport.structuredContent.files_included?.some?.((file) => file !== 'demo.txt')) {
+  throw new Error(`selected-only export included unexpected files: ${JSON.stringify(exactExport.structuredContent.files_included)}`);
+}
+const exactProContext = await fs.readFile(path.join(tmp, '.ai-bridge', 'pro-context.md'), 'utf8');
+if (!exactProContext.includes('Auto-include important root files: no') || !exactProContext.includes('Auto-include changed files: no')) {
+  throw new Error('selected-only export did not record disabled auto-inclusion settings');
+}
+if (exactProContext.includes('### AGENTS.md') || exactProContext.includes('### package.json') || exactProContext.includes('### env-ref.js')) {
+  throw new Error('selected-only export leaked auto-included important or changed files');
+}
+const agentHandoff = await client.request('tools/call', {
+  name: 'handoff_to_agent',
+  arguments: {
+    workspace_id: ws,
+    agent: 'opencode',
+    model: 'provider/cheap-model',
+    title: 'Smoke agent plan',
+    plan: '- Verify demo.txt contains write.'
+  }
+});
+if (agentHandoff.structuredContent.agent !== 'opencode') throw new Error('handoff_to_agent did not preserve target agent');
+const escapedHandoff = await client.request('tools/call', {
+  name: 'handoff_to_agent',
+  arguments: {
+    workspace_id: ws,
+    agent: 'opencode',
+    model: 'foo; touch /tmp/pwned',
+    title: 'Escaped model plan',
+    plan: '- Verify shell hints quote model names.'
+  }
+});
+const escapedPrompt = escapedHandoff.content?.find?.((part) => part.type === 'text')?.text ?? '';
+if (!escapedPrompt.includes("--model 'foo; touch /tmp/pwned'")) {
+  throw new Error(`handoff_to_agent did not shell-quote the model hint: ${escapedPrompt}`);
+}
+if (escapedPrompt.includes('--model foo; touch')) {
+  throw new Error(`handoff_to_agent exposed an unquoted model hint: ${escapedPrompt}`);
+}
+for (const bridgeFile of ['agent-status.md', 'implementation-diff.patch', 'execution-log.jsonl']) {
+  await fs.stat(path.join(tmp, '.ai-bridge', bridgeFile));
+}
+const handoffContext = await client.request('tools/call', { name: 'read_handoff', arguments: { workspace_id: ws } });
+for (const expectedFile of ['.ai-bridge/agent-status.md', '.ai-bridge/implementation-diff.patch', '.ai-bridge/execution-log.jsonl']) {
+  if (!handoffContext.structuredContent.files.includes(expectedFile)) {
+    throw new Error(`read_handoff did not include ${expectedFile}`);
+  }
+}
+const runStatePayload = {
+  version: 1,
+  state: 'completed',
+  iteration: 1,
+  plan_hash: 'smoke-plan-hash',
+  executor: 'opencode',
+  model: 'provider/cheap-model',
+  exit_code: 0,
+  timed_out: false,
+  started_at: new Date(Date.now() - 1000).toISOString(),
+  finished_at: new Date().toISOString(),
+  status_file: '.ai-bridge/agent-status.md',
+  diff_file: '.ai-bridge/implementation-diff.patch',
+  log_file: '.ai-bridge/execution-log.jsonl'
+};
+await fs.writeFile(path.join(tmp, '.ai-bridge', 'handoff-run-state.json'), `${JSON.stringify(runStatePayload, null, 2)}\n`, 'utf8');
+const waitCompleted = await client.request('tools/call', {
+  name: 'wait_for_handoff',
+  arguments: { workspace_id: ws, max_wait_seconds: 1, poll_ms: 250, plan_hash: 'smoke-plan-hash' }
+});
+if (waitCompleted.structuredContent.awaited_completed !== true || waitCompleted.structuredContent.state !== 'completed') {
+  throw new Error(`wait_for_handoff did not report completion: ${JSON.stringify(waitCompleted.structuredContent)}`);
+}
+if (waitCompleted.structuredContent.awaited_terminal !== true || waitCompleted.structuredContent.succeeded !== true) {
+  throw new Error(`wait_for_handoff did not report terminal success fields: ${JSON.stringify(waitCompleted.structuredContent)}`);
+}
+if (waitCompleted.structuredContent.exit_code !== 0 || waitCompleted.structuredContent.status_file !== '.ai-bridge/agent-status.md') {
+  throw new Error(`wait_for_handoff missing completion fields: ${JSON.stringify(waitCompleted.structuredContent)}`);
+}
+const waitMismatch = await client.request('tools/call', {
+  name: 'wait_for_handoff',
+  arguments: { workspace_id: ws, max_wait_seconds: 1, poll_ms: 250, plan_hash: 'a-different-hash' }
+});
+if (waitMismatch.structuredContent.awaited_completed !== false || waitMismatch.structuredContent.state !== 'running' || waitMismatch.structuredContent.plan_hash_mismatch !== true) {
+  throw new Error(`wait_for_handoff did not keep waiting on plan-hash mismatch: ${JSON.stringify(waitMismatch.structuredContent)}`);
+}
+await fs.writeFile(path.join(tmp, '.ai-bridge', 'handoff-run-state.json'), `${JSON.stringify({
+  ...runStatePayload,
+  state: 'failed',
+  plan_hash: 'failed-plan',
+  exit_code: 2,
+  status_file: 'demo.txt',
+  diff_file: '../demo.txt',
+  log_file: '.ai-bridge/execution-log.jsonl'
+}, null, 2)}\n`, 'utf8');
+const waitFailed = await client.request('tools/call', {
+  name: 'wait_for_handoff',
+  arguments: { workspace_id: ws, max_wait_seconds: 1, poll_ms: 250, plan_hash: 'failed-plan' }
+});
+if (waitFailed.structuredContent.awaited_terminal !== true || waitFailed.structuredContent.awaited_completed !== false || waitFailed.structuredContent.succeeded !== false || waitFailed.structuredContent.state !== 'failed') {
+  throw new Error(`wait_for_handoff did not report failed terminal state: ${JSON.stringify(waitFailed.structuredContent)}`);
+}
+if (waitFailed.structuredContent.status_file !== '.ai-bridge/agent-status.md' || waitFailed.structuredContent.diff_file !== '.ai-bridge/implementation-diff.patch') {
+  throw new Error(`wait_for_handoff trusted forged artifact paths: ${JSON.stringify(waitFailed.structuredContent)}`);
+}
+await fs.writeFile(path.join(tmp, '.ai-bridge', 'handoff-run-state.json'), `${JSON.stringify({
+  ...runStatePayload,
+  state: 'timed_out',
+  plan_hash: 'timed-out-plan',
+  exit_code: null,
+  timed_out: true
+}, null, 2)}\n`, 'utf8');
+const waitTimedOut = await client.request('tools/call', {
+  name: 'wait_for_handoff',
+  arguments: { workspace_id: ws, max_wait_seconds: 1, poll_ms: 250, plan_hash: 'timed-out-plan' }
+});
+if (waitTimedOut.structuredContent.awaited_terminal !== true || waitTimedOut.structuredContent.awaited_completed !== false || waitTimedOut.structuredContent.succeeded !== false || waitTimedOut.structuredContent.state !== 'timed_out') {
+  throw new Error(`wait_for_handoff did not report timed-out terminal state: ${JSON.stringify(waitTimedOut.structuredContent)}`);
+}
+await fs.rm(path.join(tmp, '.ai-bridge', 'handoff-run-state.json'), { force: true });
+await client.request('tools/call', { name: 'handoff_to_codex', arguments: { workspace_id: ws, title: 'Smoke Codex plan', plan: '- Verify demo.txt contains write.', append: true } });
+await fs.writeFile(path.join(tmp, '.ai-bridge', 'current-plan.md'), 'x'.repeat(190000), 'utf8');
+await expectToolError('handoff_to_agent', {
+  workspace_id: ws,
+  agent: 'opencode',
+  title: 'Oversized append plan',
+  plan: '- This append should fail before loading the existing plan.',
+  append: true
+}, /File is too large/);
+client.close();
+if (process.platform !== 'win32') {
+  const processTreeClient = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--bash', 'full', '--tool-mode', 'full'], {
+    cwd: path.resolve('.'),
+    env: { ...process.env, CODEXPRO_ROOT: tmp, CODEXPRO_ALLOWED_ROOTS: tmp, CODEXPRO_BASH_MODE: 'full' }
+  });
+  await processTreeClient.request('initialize', {
+    protocolVersion: '2024-11-05',
+    capabilities: {},
+    clientInfo: { name: 'codexpro-process-tree-smoke', version: '0.1.0' }
+  });
+  processTreeClient.notify('notifications/initialized');
+  const processTreeOpened = await processTreeClient.request('tools/call', {
+    name: 'open_current_workspace',
+    arguments: { include_tree: false }
+  });
+  const descendantPidPath = path.join(tmp, 'bash-descendant.pid');
+  const descendantScript = [
+    "const { spawn } = require('node:child_process');",
+    "const fs = require('node:fs');",
+    "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
+    `fs.writeFileSync(${JSON.stringify(descendantPidPath)}, String(child.pid));`,
+    "setInterval(() => {}, 1000);"
+  ].join('');
+  const timedOutTree = await processTreeClient.request('tools/call', {
+    name: 'bash',
+    arguments: {
+      workspace_id: processTreeOpened.structuredContent.workspace_id,
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(descendantScript)}`,
+      timeout_ms: 1000
+    }
+  });
+  if (!timedOutTree.structuredContent.stderr?.includes('Command timed out')) {
+    throw new Error(`bash process-tree smoke did not time out: ${JSON.stringify(timedOutTree.structuredContent)}`);
+  }
+  const descendantPid = Number(await fs.readFile(descendantPidPath, 'utf8'));
+  let descendantAlive = true;
+  for (let attempt = 0; attempt < 20 && descendantAlive; attempt += 1) {
+    try {
+      process.kill(descendantPid, 0);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    } catch (error) {
+      if (error?.code !== 'ESRCH') throw error;
+      descendantAlive = false;
+    }
+  }
+  if (descendantAlive) {
+    process.kill(descendantPid, 'SIGKILL');
+    throw new Error(`timed-out bash descendant ${descendantPid} survived process-group termination`);
+  }
+  processTreeClient.close();
+}
+async function assertToolMode(mode, expected, hidden, extraEnv = {}) {
+  const args = ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--bash', 'safe'];
+  if (mode) args.push('--tool-mode', mode);
+  const modeClient = new McpStdioClient('node', args, {
+    cwd: path.resolve('.'),
+    env: { ...process.env, CODEXPRO_ROOT: tmp, CODEXPRO_ALLOWED_ROOTS: tmp, CODEXPRO_TOOL_MODE: '', ...extraEnv }
+  });
+  await modeClient.request('initialize', {
+    protocolVersion: '2024-11-05',
+    capabilities: {},
+    clientInfo: { name: `codexpro-${mode || 'default'}-smoke`, version: '0.1.0' }
+  });
+  modeClient.notify('notifications/initialized');
+  const modeTools = await modeClient.request('tools/list', {});
+  const names = modeTools.tools.map((tool) => tool.name);
+  for (const expectedName of expected) {
+    if (!names.includes(expectedName)) throw new Error(`${mode || 'default'} mode missing ${expectedName}; got ${names.join(', ')}`);
+  }
+  for (const hiddenName of hidden) {
+    if (names.includes(hiddenName)) throw new Error(`${mode || 'default'} mode should hide ${hiddenName}; got ${names.join(', ')}`);
+  }
+  const superActions = await modeClient.request('tools/call', { name: 'codexpro', arguments: { action: 'list_actions' } });
+  const expectedActions = names.filter((name) => name !== 'codexpro').sort();
+  const actualActions = [...superActions.structuredContent.actions].sort();
+  if (JSON.stringify(actualActions) !== JSON.stringify(expectedActions)) {
+    throw new Error(`${mode || 'default'} supertool actions did not match registered tools: expected ${expectedActions.join(', ')} got ${actualActions.join(', ')}`);
+  }
+  modeClient.close();
+}
+
+await assertToolMode('', ['codexpro', 'server_config', 'codexpro_self_test', 'open_current_workspace', 'open_workspace', 'inspect_workspace', 'tree', 'search', 'load_skill', 'read', 'view_image', 'write', 'edit', 'apply_patch', 'import_file', 'bash', 'show_changes', 'read_handoff', 'wait_for_handoff', 'export_pro_context', 'handoff_to_agent'], ['codexpro_inventory', 'workspace_snapshot', 'git_status', 'git_diff', 'codex_context', 'handoff_to_codex']);
+await assertToolMode('minimal', ['codexpro', 'server_config', 'codexpro_self_test', 'open_current_workspace', 'open_workspace', 'read', 'write', 'edit', 'apply_patch', 'import_file', 'bash', 'show_changes'], ['inspect_workspace', 'tree', 'search', 'load_skill', 'view_image', 'read_handoff', 'wait_for_handoff', 'export_pro_context', 'handoff_to_agent', 'codex_context']);
+await assertToolMode('', ['codexpro', 'server_config', 'show_changes', 'search'], ['inspect_workspace'], { CODEXPRO_ANALYSIS: '0' });
+
+const handoffWriteClient = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--write', 'handoff'], {
+  cwd: path.resolve('.'),
+  env: { ...process.env, CODEXPRO_ROOT: tmp, CODEXPRO_ALLOWED_ROOTS: tmp, CODEXPRO_TOOL_MODE: '' }
+});
+await handoffWriteClient.request('initialize', {
+  protocolVersion: '2024-11-05',
+  capabilities: {},
+  clientInfo: { name: 'codexpro-write-handoff-smoke', version: '0.1.0' }
+});
+handoffWriteClient.notify('notifications/initialized');
+const handoffWriteTools = await handoffWriteClient.request('tools/list', {});
+const handoffWriteToolNames = handoffWriteTools.tools.map((tool) => tool.name);
+for (const hiddenWriteTool of ['write', 'edit', 'apply_patch', 'import_file']) {
+  if (handoffWriteToolNames.includes(hiddenWriteTool)) {
+    throw new Error(`--write handoff should not advertise ${hiddenWriteTool} tool; got ${handoffWriteToolNames.join(', ')}`);
+  }
+}
+const handoffWriteConfig = await handoffWriteClient.request('tools/call', { name: 'server_config', arguments: {} });
+if (handoffWriteConfig.structuredContent.writeMode !== 'handoff' || handoffWriteConfig.structuredContent.registeredTools?.includes?.('write') || handoffWriteConfig.structuredContent.registeredTools?.includes?.('edit') || handoffWriteConfig.structuredContent.registeredTools?.includes?.('apply_patch') || handoffWriteConfig.structuredContent.registeredTools?.includes?.('import_file')) {
+  throw new Error(`server_config did not report write handoff with hidden edit tools: ${JSON.stringify(handoffWriteConfig.structuredContent)}`);
+}
+const handoffSelfTest = await handoffWriteClient.request('tools/call', { name: 'codexpro_self_test', arguments: { write_probe: false, bash_probe: false, pro_context_probe: false } });
+if (handoffSelfTest.structuredContent.status === 'fail') {
+  throw new Error(`codexpro_self_test failed under --write handoff: ${JSON.stringify(handoffSelfTest.structuredContent)}`);
+}
+for (const hiddenWriteTool of ['write', 'edit', 'apply_patch', 'import_file']) {
+  if (handoffSelfTest.structuredContent.expected_tools?.includes?.(hiddenWriteTool) || handoffSelfTest.structuredContent.registered_tools?.includes?.(hiddenWriteTool)) {
+    throw new Error(`codexpro_self_test exposed ${hiddenWriteTool} under --write handoff: ${JSON.stringify(handoffSelfTest.structuredContent)}`);
+  }
+}
+handoffWriteClient.close();
+
+const noBashClient = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--bash', 'off'], {
+  cwd: path.resolve('.'),
+  env: { ...process.env, CODEXPRO_ROOT: tmp, CODEXPRO_ALLOWED_ROOTS: tmp, CODEXPRO_TOOL_MODE: '' }
+});
+await noBashClient.request('initialize', {
+  protocolVersion: '2024-11-05',
+  capabilities: {},
+  clientInfo: { name: 'codexpro-no-bash-smoke', version: '0.1.0' }
+});
+noBashClient.notify('notifications/initialized');
+const noBashTools = await noBashClient.request('tools/list', {});
+const noBashToolNames = noBashTools.tools.map((tool) => tool.name);
+if (noBashToolNames.includes('bash')) {
+  throw new Error(`--bash off should not advertise bash tool; got ${noBashToolNames.join(', ')}`);
+}
+const noBashConfig = await noBashClient.request('tools/call', { name: 'server_config', arguments: {} });
+if (noBashConfig.structuredContent.bashMode !== 'off') {
+  throw new Error(`server_config did not report bash off: ${JSON.stringify(noBashConfig.structuredContent)}`);
+}
+noBashClient.close();
+
+const disabledWriteClient = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--write', 'off'], {
+  cwd: path.resolve('.'),
+  env: { ...process.env, CODEXPRO_ROOT: tmp, CODEXPRO_ALLOWED_ROOTS: tmp, CODEXPRO_TOOL_MODE: '' }
+});
+await disabledWriteClient.request('initialize', {
+  protocolVersion: '2024-11-05',
+  capabilities: {},
+  clientInfo: { name: 'codexpro-write-off-smoke', version: '0.1.0' }
+});
+disabledWriteClient.notify('notifications/initialized');
+const disabledWriteTools = await disabledWriteClient.request('tools/list', {});
+const disabledWriteToolNames = disabledWriteTools.tools.map((tool) => tool.name);
+for (const hiddenWriteTool of ['write', 'edit', 'apply_patch', 'import_file']) {
+  if (disabledWriteToolNames.includes(hiddenWriteTool)) {
+    throw new Error(`--write off should not advertise ${hiddenWriteTool} tool; got ${disabledWriteToolNames.join(', ')}`);
+  }
+}
+const disabledWriteConfig = await disabledWriteClient.request('tools/call', { name: 'server_config', arguments: {} });
+if (disabledWriteConfig.structuredContent.writeMode !== 'off') {
+  throw new Error(`server_config did not report write off: ${JSON.stringify(disabledWriteConfig.structuredContent)}`);
+}
+const disabledSelfTest = await disabledWriteClient.request('tools/call', { name: 'codexpro_self_test', arguments: { write_probe: false, bash_probe: false, pro_context_probe: false } });
+if (disabledSelfTest.structuredContent.status === 'fail') {
+  throw new Error(`codexpro_self_test failed under --write off: ${JSON.stringify(disabledSelfTest.structuredContent)}`);
+}
+for (const hiddenWriteTool of ['write', 'edit', 'apply_patch', 'import_file']) {
+  if (disabledSelfTest.structuredContent.expected_tools?.includes?.(hiddenWriteTool) || disabledSelfTest.structuredContent.registered_tools?.includes?.(hiddenWriteTool)) {
+    throw new Error(`codexpro_self_test exposed ${hiddenWriteTool} under --write off: ${JSON.stringify(disabledSelfTest.structuredContent)}`);
+  }
+}
+disabledWriteClient.close();
+
+const standardCodexSessionsClient = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp], {
+  cwd: path.resolve('.'),
+  env: {
+    ...process.env,
+    CODEXPRO_ROOT: tmp,
+    CODEXPRO_ALLOWED_ROOTS: tmp,
+    CODEXPRO_CODEX_SESSIONS: 'metadata',
+    CODEXPRO_CODEX_DIR: codexHistoryDir
+  }
+});
+await standardCodexSessionsClient.request('initialize', {
+  protocolVersion: '2024-11-05',
+  capabilities: {},
+  clientInfo: { name: 'codexpro-standard-codex-sessions-smoke', version: '0.1.0' }
+});
+standardCodexSessionsClient.notify('notifications/initialized');
+const standardCodexSessionTools = await standardCodexSessionsClient.request('tools/list', {});
+const standardCodexSessionToolNames = standardCodexSessionTools.tools.map((tool) => tool.name);
+if (!standardCodexSessionToolNames.includes('codex_sessions')) {
+  throw new Error(`standard mode with Codex sessions enabled missed codex_sessions: ${standardCodexSessionToolNames.join(', ')}`);
+}
+if (standardCodexSessionToolNames.includes('read_codex_session')) {
+  throw new Error(`metadata mode should not expose read_codex_session: ${standardCodexSessionToolNames.join(', ')}`);
+}
+const metadataSessions = await standardCodexSessionsClient.request('tools/call', { name: 'codex_sessions', arguments: { query: 'Large tail summary', max_sessions: 5 } });
+if (metadataSessions.structuredContent.total_found !== 0 || JSON.stringify(metadataSessions.structuredContent).includes('Large tail summary')) {
+  throw new Error(`metadata mode exposed transcript tail content: ${JSON.stringify(metadataSessions.structuredContent)}`);
+}
+standardCodexSessionsClient.close();
+
+const fullTranscriptClient = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--bash', 'safe'], {
+  cwd: path.resolve('.'),
+  env: { ...process.env, CODEXPRO_ROOT: tmp, CODEXPRO_ALLOWED_ROOTS: tmp, CODEXPRO_BASH_TRANSCRIPT: 'full' }
+});
+await fullTranscriptClient.request('initialize', {
+  protocolVersion: '2024-11-05',
+  capabilities: {},
+  clientInfo: { name: 'codexpro-full-bash-transcript-smoke', version: '0.1.0' }
+});
+fullTranscriptClient.notify('notifications/initialized');
+const fullTranscriptBash = await fullTranscriptClient.request('tools/call', { name: 'bash', arguments: { command: 'pwd' } });
+const fullTranscriptText = fullTranscriptBash.content?.[0]?.text ?? '';
+const fullTranscriptStdout = (fullTranscriptBash.structuredContent.stdout ?? '').trim();
+if (!fullTranscriptText.includes('## stdout') || !fullTranscriptStdout || !fullTranscriptText.includes(fullTranscriptStdout)) {
+  throw new Error(`full bash transcript mode did not preserve raw stdout in chat text: ${fullTranscriptText}`);
+}
+fullTranscriptClient.close();
+
+const emptyCodexDirClient = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp], {
+  cwd: path.resolve('.'),
+  env: {
+    ...process.env,
+    CODEXPRO_ROOT: tmp,
+    CODEXPRO_ALLOWED_ROOTS: tmp,
+    CODEXPRO_CODEX_DIR: ''
+  }
+});
+await emptyCodexDirClient.request('initialize', {
+  protocolVersion: '2024-11-05',
+  capabilities: {},
+  clientInfo: { name: 'codexpro-empty-codex-dir-smoke', version: '0.1.0' }
+});
+emptyCodexDirClient.notify('notifications/initialized');
+const emptyCodexDirConfig = await emptyCodexDirClient.request('tools/call', { name: 'server_config', arguments: {} });
+const expectedDefaultCodexDir = path.join(os.homedir(), '.codex');
+if (emptyCodexDirConfig.structuredContent.codexDir !== expectedDefaultCodexDir) {
+  throw new Error(`empty CODEXPRO_CODEX_DIR resolved to ${emptyCodexDirConfig.structuredContent.codexDir}, expected ${expectedDefaultCodexDir}`);
+}
+emptyCodexDirClient.close();
+
+const invalidContextDir = spawnSync('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp], {
+  cwd: path.resolve('.'),
+  env: { ...process.env, CODEXPRO_ROOT: tmp, CODEXPRO_ALLOWED_ROOTS: tmp, CODEXPRO_CONTEXT_DIR: 'src' },
+  encoding: 'utf8',
+  timeout: 5000
+});
+if (invalidContextDir.status === 0 || !String(invalidContextDir.stderr || invalidContextDir.stdout).includes('CODEXPRO_CONTEXT_DIR')) {
+  throw new Error(`invalid CODEXPRO_CONTEXT_DIR=src was not rejected: status=${invalidContextDir.status} stdout=${invalidContextDir.stdout} stderr=${invalidContextDir.stderr}`);
+}
+
+const codexSessionsClient = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--tool-mode', 'full'], {
+  cwd: path.resolve('.'),
+  env: {
+    ...process.env,
+    CODEXPRO_ROOT: tmp,
+    CODEXPRO_ALLOWED_ROOTS: tmp,
+    CODEXPRO_CODEX_SESSIONS: 'read',
+    CODEXPRO_CODEX_DIR: codexHistoryDir
+  }
+});
+await codexSessionsClient.request('initialize', {
+  protocolVersion: '2024-11-05',
+  capabilities: {},
+  clientInfo: { name: 'codexpro-codex-sessions-smoke', version: '0.1.0' }
+});
+codexSessionsClient.notify('notifications/initialized');
+const codexSessionTools = await codexSessionsClient.request('tools/list', {});
+const codexSessionToolNames = codexSessionTools.tools.map((tool) => tool.name);
+for (const expectedName of ['codex_sessions', 'read_codex_session']) {
+  if (!codexSessionToolNames.includes(expectedName)) {
+    throw new Error(`codex session opt-in mode missing ${expectedName}: ${codexSessionToolNames.join(', ')}`);
+  }
+}
+const codexSessions = await codexSessionsClient.request('tools/call', { name: 'codex_sessions', arguments: { max_sessions: 5 } });
+const session = codexSessions.structuredContent.sessions?.[0];
+if (!session || session.session_id !== '019cc369-bd7c-7891-b371-7b20b4fe0b18' || session.title !== 'Fix the smoke session browser' || session.project_dir !== tmp) {
+  throw new Error(`codex_sessions did not return parsed Codex metadata: ${JSON.stringify(codexSessions.structuredContent)}`);
+}
+if (session.resume_command !== 'codex resume 019cc369-bd7c-7891-b371-7b20b4fe0b18') {
+  throw new Error(`codex_sessions returned wrong resume command: ${JSON.stringify(session)}`);
+}
+const codexTranscript = await codexSessionsClient.request('tools/call', {
+  name: 'read_codex_session',
+  arguments: { session_id: '019cc369-bd7c-7891-b371-7b20b4fe0b18', max_messages: 10 }
+});
+if (!codexTranscript.content?.[0]?.text?.includes('Fix the smoke session browser') || !codexTranscript.content?.[0]?.text?.includes('[Tool: bash]')) {
+  throw new Error(`read_codex_session did not return bounded transcript text: ${codexTranscript.content?.[0]?.text}`);
+}
+const topOneSessions = await codexSessionsClient.request('tools/call', { name: 'codex_sessions', arguments: { max_sessions: 1 } });
+if (topOneSessions.structuredContent.sessions?.some?.((item) => item.session_id === olderCodexSessionId)) {
+  throw new Error(`codex_sessions max_sessions did not limit visible results: ${JSON.stringify(topOneSessions.structuredContent)}`);
+}
+const olderCodexTranscript = await codexSessionsClient.request('tools/call', {
+  name: 'read_codex_session',
+  arguments: { session_id: olderCodexSessionId, max_messages: 10 }
+});
+if (!olderCodexTranscript.content?.[0]?.text?.includes('Older session still readable by id')) {
+  throw new Error(`read_codex_session only searched visible list window: ${olderCodexTranscript.content?.[0]?.text}`);
+}
+const sourcePathTranscript = await codexSessionsClient.request('tools/call', {
+  name: 'read_codex_session',
+  arguments: { source_path: session.source_path, max_messages: 10 }
+});
+if (!sourcePathTranscript.content?.[0]?.text?.includes('Fix the smoke session browser')) {
+  throw new Error(`read_codex_session rejected source_path returned by codex_sessions: ${sourcePathTranscript.content?.[0]?.text}`);
+}
+const oversizedTailPage = await codexSessionsClient.request('tools/call', {
+  name: 'read_codex_session',
+  arguments: { session_id: oversizedCodexSessionId, max_messages: 2 }
+});
+if (
+  oversizedTailPage.structuredContent.direction !== 'tail' ||
+  !oversizedTailPage.content?.[0]?.text?.includes('Oversized session tail answer') ||
+  !oversizedTailPage.content?.[0]?.text?.includes('Oversized session latest request') ||
+  !oversizedTailPage.structuredContent.has_more ||
+  !Number.isInteger(oversizedTailPage.structuredContent.next_cursor) ||
+  oversizedTailPage.structuredContent.resume_cursor !== oversizedTailPage.structuredContent.next_cursor ||
+  oversizedTailPage.structuredContent.source_size_bytes <= 20_000_000
+) {
+  throw new Error(`read_codex_session did not tail-page an oversized session: ${JSON.stringify(oversizedTailPage.structuredContent)}`);
+}
+const boundedToolOutputPage = await codexSessionsClient.request('tools/call', {
+  name: 'read_codex_session',
+  arguments: {
+    session_id: oversizedCodexSessionId,
+    cursor: oversizedTailPage.structuredContent.next_cursor,
+    max_messages: 1,
+    max_tool_output_bytes: 128
+  }
+});
+const boundedToolOutput = boundedToolOutputPage.structuredContent.messages?.[0]?.content ?? '';
+if (
+  boundedToolOutputPage.structuredContent.messages?.[0]?.role !== 'tool' ||
+  Buffer.byteLength(boundedToolOutput, 'utf8') > 128 ||
+  !boundedToolOutput.includes('[Tool output truncated]')
+) {
+  throw new Error(`read_codex_session did not bound a large tool output: ${JSON.stringify(boundedToolOutputPage.structuredContent)}`);
+}
+const tinyToolOutputPage = await codexSessionsClient.request('tools/call', {
+  name: 'read_codex_session',
+  arguments: {
+    session_id: oversizedCodexSessionId,
+    cursor: oversizedTailPage.structuredContent.next_cursor,
+    max_messages: 1,
+    max_tool_output_bytes: 1
+  }
+});
+const tinyToolOutput = tinyToolOutputPage.structuredContent.messages?.[0]?.content ?? '';
+if (
+  tinyToolOutputPage.structuredContent.messages?.[0]?.role !== 'tool' ||
+  Buffer.byteLength(tinyToolOutput, 'utf8') > 1
+) {
+  throw new Error(`read_codex_session exceeded a tiny tool-output cap: ${JSON.stringify(tinyToolOutputPage.structuredContent)}`);
+}
+const zeroToolOutputPage = await codexSessionsClient.request('tools/call', {
+  name: 'read_codex_session',
+  arguments: {
+    session_id: oversizedCodexSessionId,
+    cursor: oversizedTailPage.structuredContent.next_cursor,
+    max_messages: 1,
+    max_tool_output_bytes: 0
+  }
+});
+if (!zeroToolOutputPage.content?.[0]?.text?.includes('Oversized session first request')) {
+  throw new Error(`read_codex_session did not omit zero-byte tool output: ${zeroToolOutputPage.content?.[0]?.text}`);
+}
+const excludedToolOutputPage = await codexSessionsClient.request('tools/call', {
+  name: 'read_codex_session',
+  arguments: {
+    session_id: oversizedCodexSessionId,
+    cursor: oversizedTailPage.structuredContent.next_cursor,
+    max_messages: 1,
+    exclude_tool_outputs: true
+  }
+});
+if (!excludedToolOutputPage.content?.[0]?.text?.includes('Oversized session first request')) {
+  throw new Error(`read_codex_session did not skip tool outputs: ${excludedToolOutputPage.content?.[0]?.text}`);
+}
+const oversizedHeadPage = await codexSessionsClient.request('tools/call', {
+  name: 'read_codex_session',
+  arguments: { session_id: oversizedCodexSessionId, direction: 'head', max_messages: 1 }
+});
+if (
+  oversizedHeadPage.structuredContent.direction !== 'head' ||
+  !oversizedHeadPage.content?.[0]?.text?.includes('Oversized session first request') ||
+  !Number.isInteger(oversizedHeadPage.structuredContent.next_cursor)
+) {
+  throw new Error(`read_codex_session did not head-page an oversized session: ${JSON.stringify(oversizedHeadPage.structuredContent)}`);
+}
+const oversizedHeadSecondPage = await codexSessionsClient.request('tools/call', {
+  name: 'read_codex_session',
+  arguments: {
+    session_id: oversizedCodexSessionId,
+    direction: 'head',
+    cursor: oversizedHeadPage.structuredContent.next_cursor,
+    max_messages: 1,
+    exclude_tool_outputs: true
+  }
+});
+const oversizedHeadThirdPage = await codexSessionsClient.request('tools/call', {
+  name: 'read_codex_session',
+  arguments: {
+    session_id: oversizedCodexSessionId,
+    direction: 'head',
+    cursor: oversizedHeadSecondPage.structuredContent.next_cursor,
+    max_messages: 1,
+    exclude_tool_outputs: true
+  }
+});
+const headPageContents = [
+  oversizedHeadPage.structuredContent.messages?.[0]?.content,
+  oversizedHeadSecondPage.structuredContent.messages?.[0]?.content,
+  oversizedHeadThirdPage.structuredContent.messages?.[0]?.content
+];
+if (
+  JSON.stringify(headPageContents) !== JSON.stringify([
+    'Oversized session first request',
+    'Oversized session tail answer',
+    'Oversized session latest request'
+  ]) ||
+  oversizedHeadThirdPage.structuredContent.has_more ||
+  !Number.isInteger(oversizedHeadThirdPage.structuredContent.resume_cursor)
+) {
+  throw new Error(`read_codex_session head pagination skipped or duplicated messages: ${JSON.stringify(headPageContents)}`);
+}
+await expectToolError(
+  'read_codex_session',
+  {
+    session_id: oversizedCodexSessionId,
+    cursor: oversizedTailPage.structuredContent.source_size_bytes + 1
+  },
+  /cursor is beyond the current Codex session file/i,
+  codexSessionsClient
+);
+const oversizedSourceAfterRead = await fs.stat(oversizedCodexSessionPath);
+if (
+  oversizedSourceAfterRead.size !== oversizedSourceBeforeRead.size ||
+  oversizedSourceAfterRead.mtimeMs !== oversizedSourceBeforeRead.mtimeMs
+) {
+  throw new Error('read_codex_session modified the source JSONL');
+}
+await fs.appendFile(oversizedCodexSessionPath, JSON.stringify({
+  timestamp: '2026-06-16T01:02:08Z',
+  type: 'response_item',
+  payload: { type: 'message', role: 'assistant', content: 'Oversized session appended answer' }
+}) + '\n', 'utf8');
+const appendedHeadPage = await codexSessionsClient.request('tools/call', {
+  name: 'read_codex_session',
+  arguments: {
+    session_id: oversizedCodexSessionId,
+    direction: 'head',
+    cursor: oversizedHeadThirdPage.structuredContent.resume_cursor,
+    max_messages: 1
+  }
+});
+if (!appendedHeadPage.content?.[0]?.text?.includes('Oversized session appended answer')) {
+  throw new Error(`read_codex_session could not resume after an append: ${appendedHeadPage.content?.[0]?.text}`);
+}
+const byteBoundaryPage = await codexSessionsClient.request('tools/call', {
+  name: 'read_codex_session',
+  arguments: { session_id: byteBoundaryCodexSessionId, max_messages: 1, max_total_bytes: 4000 }
+});
+const byteBoundaryContent = byteBoundaryPage.structuredContent.messages?.[0]?.content ?? '';
+if (Buffer.byteLength(byteBoundaryContent, 'utf8') > 4000) {
+  throw new Error(`read_codex_session exceeded max_total_bytes at a UTF-8 boundary: ${Buffer.byteLength(byteBoundaryContent, 'utf8')}`);
+}
+const largeTailSessions = await codexSessionsClient.request('tools/call', { name: 'codex_sessions', arguments: { query: 'Large tail summary', max_sessions: 5 } });
+if (largeTailSessions.structuredContent.total_found !== 0 || JSON.stringify(largeTailSessions.structuredContent).includes('Large tail summary')) {
+  throw new Error(`read mode codex_sessions exposed transcript tail summary: ${JSON.stringify(largeTailSessions.structuredContent)}`);
+}
+codexSessionsClient.close();
+
+const sessionGuardClient = new McpStdioClient('node', [
+  'dist/stdio.js',
+  '--root',
+  tmp,
+  '--allow-root',
+  tmp,
+  '--bash',
+  'safe',
+  '--bash-session',
+  'codex-main',
+  '--require-bash-session'
+], {
+  cwd: path.resolve('.'),
+  env: {
+    ...process.env,
+    CODEXPRO_ROOT: tmp,
+    CODEXPRO_ALLOWED_ROOTS: tmp,
+    CODEXPRO_BASH_SESSION_ID: '',
+    CODEXPRO_REQUIRE_BASH_SESSION: ''
+  }
+});
+await sessionGuardClient.request('initialize', {
+  protocolVersion: '2024-11-05',
+  capabilities: {},
+  clientInfo: { name: 'codexpro-bash-session-smoke', version: '0.1.0' }
+});
+sessionGuardClient.notify('notifications/initialized');
+const guardedConfig = await sessionGuardClient.request('tools/call', { name: 'server_config', arguments: {} });
+if (guardedConfig.structuredContent.bashSessionId !== 'codex-main' || guardedConfig.structuredContent.requireBashSession !== true) {
+  throw new Error(`server_config did not expose bash session guard: ${JSON.stringify(guardedConfig.structuredContent)}`);
+}
+await expectToolError('bash', { command: 'pwd' }, /bash session/i, sessionGuardClient);
+await expectToolError('bash', { command: 'pwd', session_id: 'other-session' }, /codex-main/i, sessionGuardClient);
+const guardedBash = await sessionGuardClient.request('tools/call', { name: 'bash', arguments: { command: 'pwd', session_id: 'codex-main' } });
+if (guardedBash.structuredContent.bash_session_id !== 'codex-main' || !guardedBash.content?.[0]?.text?.includes('Exit: 0')) {
+  throw new Error(`bash session guard did not allow matching session id: ${JSON.stringify(guardedBash.structuredContent)}`);
+}
+const guardedSelfTest = await sessionGuardClient.request('tools/call', {
+  name: 'codexpro_self_test',
+  arguments: { write_probe: false, pro_context_probe: false }
+});
+if (guardedSelfTest.structuredContent.status === 'fail') {
+  throw new Error(`codexpro_self_test failed under bash session guard: ${JSON.stringify(guardedSelfTest.structuredContent.checks)}`);
+}
+sessionGuardClient.close();
+
+const nonGitRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-non-git-'));
+await fs.writeFile(path.join(nonGitRoot, 'README.md'), '# Non-git fixture\n', 'utf8');
+const nonGitClient = new McpStdioClient('node', ['dist/stdio.js', '--root', nonGitRoot, '--allow-root', nonGitRoot, '--tool-mode', 'full'], {
+  cwd: path.resolve('.'),
+  env: { ...process.env, CODEXPRO_ROOT: nonGitRoot, CODEXPRO_ALLOWED_ROOTS: nonGitRoot }
+});
+await nonGitClient.request('initialize', {
+  protocolVersion: '2024-11-05',
+  capabilities: {},
+  clientInfo: { name: 'codexpro-non-git-smoke', version: '0.1.0' }
+});
+nonGitClient.notify('notifications/initialized');
+const nonGitDiff = await nonGitClient.request('tools/call', { name: 'git_diff', arguments: { include_diff: false } });
+const nonGitPayload = JSON.stringify(nonGitDiff);
+if (!nonGitDiff.structuredContent.diff_error || !nonGitDiff.structuredContent.diff || nonGitDiff.structuredContent.changed) {
+  throw new Error(`git_diff include_diff=false hid non-git diagnostics: ${nonGitPayload}`);
+}
+if (!/not a git repository|git unavailable|fatal:/i.test(nonGitPayload)) {
+  throw new Error(`git_diff include_diff=false did not preserve the git diagnostic text: ${nonGitPayload}`);
+}
+nonGitClient.close();
+
+const lowerAgentsRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-lower-agents-'));
+await fs.writeFile(path.join(lowerAgentsRoot, 'agents.md'), '# Lowercase agents\n\n- Lowercase instruction file loaded.\n', 'utf8');
+await fs.mkdir(path.join(lowerAgentsRoot, 'src'));
+await fs.writeFile(path.join(lowerAgentsRoot, 'src', 'demo.ts'), 'export const demo = true;\n', 'utf8');
+const lowerClient = new McpStdioClient('node', ['dist/stdio.js', '--root', lowerAgentsRoot, '--allow-root', lowerAgentsRoot, '--tool-mode', 'full'], {
+  cwd: path.resolve('.'),
+  env: { ...process.env, CODEXPRO_ROOT: lowerAgentsRoot, CODEXPRO_ALLOWED_ROOTS: lowerAgentsRoot }
+});
+await lowerClient.request('initialize', {
+  protocolVersion: '2024-11-05',
+  capabilities: {},
+  clientInfo: { name: 'codexpro-lower-agents-smoke', version: '0.1.0' }
+});
+lowerClient.notify('notifications/initialized');
+const lowerOpened = await lowerClient.request('tools/call', { name: 'open_current_workspace', arguments: { include_tree: false } });
+if (lowerOpened.structuredContent.agents_path !== 'agents.md') {
+  throw new Error(`lowercase agents.md was reported as ${lowerOpened.structuredContent.agents_path}`);
+}
+const lowerContext = await lowerClient.request('tools/call', { name: 'codex_context', arguments: { target_path: 'src/demo.ts', include_ai_bridge: false, include_git: false } });
+if (!lowerContext.structuredContent.agents_files.includes('agents.md')) {
+  throw new Error(`codex_context did not preserve lowercase agents.md: ${lowerContext.structuredContent.agents_files.join(', ')}`);
+}
+if (!lowerContext.content?.[0]?.text?.includes('Lowercase instruction file loaded.')) {
+  throw new Error('codex_context did not include lowercase agents.md content');
+}
+lowerClient.close();
+console.log('✓ smoke test passed');
