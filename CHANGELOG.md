@@ -3,8 +3,9 @@
 ## Unreleased
 
 - Fixed Streamable HTTP MCP session pruning so a live `GET /mcp` stream is not deleted merely because its session TTL elapsed; only inactive sessions are TTL/capacity candidates, and response close/finish now restarts the idle timer.
-- Changed HTTP session capacity handling to a soft cap with a five-minute grace window plus a higher emergency ceiling, preventing reconnect storms when ChatGPT creates bursts of short-lived sessions. `/healthz` now reports total/active HTTP session counts for diagnostics.
+- Removed normal-path HTTP session capacity eviction: inactive sessions are cleaned by TTL, while a high emergency ceiling remains for pathological leaks. This avoids reconnect churn when clients create bursts of short-lived sessions. `/healthz` reports total/active session counts for diagnostics.
 - Added persistent background bash jobs and `bash_job_status`; long-running batch commands can detach automatically so request timeouts no longer terminate the underlying process. Added focused regression coverage for both background jobs and live-session TTL handling.
+- Capped `bash_job_status` long-poll waits at 15 seconds so long-running jobs return periodic control to the client instead of holding one MCP request open for up to a minute.
 
 ## 0.30.0 (2026-08-08)
 

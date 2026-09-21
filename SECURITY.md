@@ -1,6 +1,6 @@
 # Security Policy
 
-Opti-CodexPro exposes a local workspace to an MCP client. Treat it like a developer tool with access to your source tree, not like a hosted SaaS app.
+CodexPro exposes a local workspace to an MCP client. Treat it like a developer tool with access to your source tree, not like a hosted SaaS app.
 
 ## Supported Version
 
@@ -12,17 +12,17 @@ Feature-specific notes follow GitHub `main`; npm users should check the publishe
 
 Please report security issues privately before opening a public issue. If the repository has GitHub private vulnerability reporting enabled, use that. Otherwise contact the maintainer listed by the project owner.
 
-Do not include secrets, private repository contents, tunnel tokens, or `.env` values in reports.
+Use this repository's [GitHub security advisory form](https://github.com/yanchun2530/opti-codexpro/security/advisories/new) for private reports when it is available. Do not include secrets, private repository contents, tunnel tokens, or `.env` values in reports.
 
 ## Terms Boundary
 
-Opti-CodexPro is not designed to bypass, avoid, pool, resell, or modify ChatGPT, Codex, OpenAI, or third-party model limits. Do not market, deploy, or configure it that way.
+CodexPro is not designed to bypass, avoid, pool, resell, or modify ChatGPT, Codex, OpenAI, or third-party model limits. Do not market, deploy, or configure it that way.
 
 Each user should connect their own ChatGPT account, use only product surfaces available to that account, and follow the limits, safety rules, and terms for ChatGPT, Codex, OpenAI, and any third-party model provider they connect.
 
 ## Threat Model
 
-Opti-CodexPro can expose:
+CodexPro can expose:
 
 - file metadata and selected file contents from allowed workspaces
 - git status and diffs
@@ -39,8 +39,8 @@ Review changes against these failure modes before release:
 
 | Failure mode | Expected control |
 | --- | --- |
-| Public tunnel reachable without a secret | Public/non-loopback HTTP fails closed unless a Opti-CodexPro token is configured. |
-| Raw Opti-CodexPro or Cloudflare token appears in UI, logs, docs, or package output | Tokens are redacted in profile/status output and tunnel tokens use local files for persistence. |
+| Public tunnel reachable without a secret | Public/non-loopback HTTP fails closed unless a CodexPro token is configured. |
+| Raw CodexPro or Cloudflare token appears in UI, logs, docs, or package output | Tokens are redacted in profile/status output and tunnel tokens use local files for persistence. |
 | ChatGPT can edit outside the intended repo | Allowed roots are explicit; path resolution rejects escapes, blocked globs, and symlink traversal. |
 | ChatGPT can run arbitrary shell by default | Bash defaults to safe mode, can be disabled, and full mode is a trusted-local-only choice. Safe mode can still run repo package scripts, so use `--no-bash` for untrusted repos. |
 | Handoff mode still exposes generic writes | Handoff/pro modes do not advertise generic `write`/`edit`/`apply_patch`; bounded handoff tools write `.ai-bridge` files only. |
@@ -87,7 +87,7 @@ codexpro start \
   --tunnel cloudflare
 ```
 
-For stable public hostnames, keep the Opti-CodexPro auth token stable but private:
+For stable public hostnames, keep the CodexPro auth token stable but private:
 
 ```bash
 mkdir -p ~/.codexpro
@@ -119,17 +119,17 @@ codexpro start \
 - Keep `loop-handoff` local. Do not use it to automate ChatGPT Web, Codex approvals, account access, third-party Pro sites, quota limits, or product safety prompts.
 - Use default agent mode only with trusted ChatGPT sessions and repo-specific roots.
 - Use `--no-bash` when ChatGPT should never trigger shell commands in the workspace.
-- Use `--bash-session <id> --require-bash-session` when bash should be enabled only for calls that explicitly target this local Opti-CodexPro terminal label.
+- Use `--bash-session <id> --require-bash-session` when bash should be enabled only for calls that explicitly target this local CodexPro terminal label.
 - Keep Codex session history access off unless needed. `--codex-sessions metadata` only lists local Codex JSONL metadata; `--codex-sessions read` allows bounded transcript reads.
-- Keep `CODEXPRO_CONTEXT_DIR` as a workspace-relative hidden directory such as `.ai-bridge`; Opti-CodexPro rejects source, build, dependency, credential, and absolute context directories.
+- Keep `CODEXPRO_CONTEXT_DIR` as a workspace-relative hidden directory such as `.ai-bridge`; CodexPro rejects source, build, dependency, credential, and absolute context directories.
 - Use `--bash full` only for trusted local repos.
-- Do not treat MCP session ids or bash session labels as Codex conversation ids. Opti-CodexPro does not execute inside a Codex app session.
+- Do not treat MCP session ids or bash session labels as Codex conversation ids. CodexPro does not execute inside a Codex app session.
 - Prefer a repo-specific `--root` instead of `--allow-home`.
 - Use `--no-install-cloudflared --cloudflared <path>` if your organization requires a managed Cloudflare Tunnel binary.
 
 ## Cloudflare Binary Install
 
-For the one-command public tunnel flow, Opti-CodexPro can download the official Cloudflare `cloudflared` release into `~/.codexpro/bin` on supported macOS, Windows, and Linux systems. It does not install a system service, does not use sudo/admin rights, and does not modify shell startup files.
+For the one-command public tunnel flow, CodexPro can download the official Cloudflare `cloudflared` release into `~/.codexpro/bin` on supported macOS, Windows, and Linux systems. It does not install a system service, does not use sudo/admin rights, and does not modify shell startup files.
 
 Resolution order:
 
@@ -140,7 +140,7 @@ Resolution order:
 4. download the pinned official Cloudflare release unless --no-install-cloudflared is set
 ```
 
-Opti-CodexPro currently pins `cloudflared` `2026.7.2` and verifies the selected asset
+CodexPro currently pins `cloudflared` `2026.7.2` and verifies the selected asset
 against its published SHA-256 before writing or extracting it. Updating the
 version requires updating every supported platform digest in
 `scripts/cloudflared-release.mjs` and passing `npm run test:settings`.
@@ -150,7 +150,7 @@ Use `--install-cloudflared` to reinstall the verified pinned binary. Use
 
 ## Built-In Guards
 
-Opti-CodexPro blocks common sensitive paths by default:
+CodexPro blocks common sensitive paths by default:
 
 - `.env` and `.env.*`
 - `.git` internals

@@ -38,7 +38,7 @@ ChatGPT 可以读取、搜索、编辑、审查、验证、导入附件，并写
 - ChatGPT Web 可用的 HTTPS 地址（tunnel 或 Tailscale Funnel）
 
 ```bash
-git clone https://github.com/your-org/opti-codexpro.git
+git clone https://github.com/yanchun2530/opti-codexpro.git
 cd opti-codexpro
 npm install
 npm run build
@@ -89,6 +89,7 @@ opti-codexpro start
    opti-codexpro start \
      --root /absolute/path/to/repo \
      --bash safe \
+     --bash-runtime powershell \
      --write workspace \
      --tunnel tailscale \
      --hostname <device-funnel-hostname>
@@ -228,8 +229,8 @@ Codex CLI，也不会偷偷调用其他后端模型；当前网页模型负责�
 ```
 
 可用方法包括 `auto`、`re2`、`bon`、`cot_reflection`、`self_consistency`、`moa`、`plansearch`、
-`rto`、`z3`、`leap`、`cepo` 和 `mars`。旧的 `think` 与 `reasoning_runtime` 仍保留为兼容别名，
-最终会路由到同一个 OptiLLM 运行时。
+`rto`、`z3`、`leap`、`cepo` 和 `mars`。公开工具只有 `optillm_runtime`；旧的 `think` 与
+`reasoning_runtime` 别名已移除。
 
 该运行时展示阶段、指令、候选答案、验证结果和最终结果，但不会导出模型的私有隐藏思维链；
 需要展示过程时，应使用这些结构化阶段数据。

@@ -381,7 +381,7 @@ For service managers and background launches, use `codexpro start --headless`. I
 
 GitHub Pages gives `owner.github.io` only to the GitHub user or organization named `owner`.
 
-The `codexpro` GitHub username already exists, so this repo cannot use `codexpro.github.io` from the `your-org` account.
+GitHub Pages is optional. If you publish the project documentation, configure the Pages URL for your own repository or deployment.
 
 The clean GitHub Pages URL for this project is:
 

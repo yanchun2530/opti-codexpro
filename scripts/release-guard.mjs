@@ -3,6 +3,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const CODEXPRO_PACKAGE = "opti-codexpro";
+export const CODEXPRO_REPOSITORY = "git+https://github.com/yanchun2530/opti-codexpro.git";
 export const CODEXPRO_ROOT = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), ".."));
 
 function canonicalPath(value) {
@@ -15,7 +16,7 @@ function canonicalPath(value) {
 
 function releaseRootError(actualPath) {
   return new Error(
-    `Release commands must run from the Opti-CodexPro root (${CODEXPRO_ROOT}). ` +
+    `Release commands must run from the CodexPro root (${CODEXPRO_ROOT}). ` +
     `Current directory is ${actualPath}. Change directory first; do not use npm --prefix for npm pack or npm publish.`
   );
 }
@@ -37,6 +38,9 @@ export function assertCodexProReleaseEnvironment({ cwd = process.cwd(), env = pr
   if (packageJson.name !== CODEXPRO_PACKAGE) {
     throw new Error(`Expected package name ${CODEXPRO_PACKAGE}; found ${packageJson.name ?? "(missing)"}.`);
   }
+  if (packageJson.repository?.url !== CODEXPRO_REPOSITORY) {
+    throw new Error("CodexPro repository metadata does not match the canonical release repository.");
+  }
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(packageJson.version ?? "")) {
     throw new Error("CodexPro package.json has an invalid release version.");
   }
@@ -55,7 +59,7 @@ function isDirectInvocation() {
 if (isDirectInvocation()) {
   try {
     const release = assertCodexProReleaseEnvironment();
-    console.log(`Opti-CodexPro release guard: ${release.name}@${release.version}`);
+    console.log(`CodexPro release guard: ${release.name}@${release.version}`);
   } catch (error) {
     console.error(`[release guard] ${error.message}`);
     process.exitCode = 1;

@@ -4,22 +4,24 @@ import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type { CodexProConfig } from "./config.js";
-import { WorkspaceManager, PathGuard, CodexProError, type Workspace } from "./guard.js";
-import { repoTree, readTextFile, writeTextFile, editTextFile, ensureAiBridge, withFileWriteLocks } from "./fsOps.js";
+import { MAX_BASH_TIMEOUT_MS, type CodexProConfig } from "./config.js";
+import { WorkspaceManager, PathGuard, CodexProError, type Workspace, type WorkspaceRegistry } from "./guard.js";
+import { repoTree, listFiles, readTextFile, writeTextFile, editTextFile, ensureAiBridge, withFileWriteLocks } from "./fsOps.js";
 import { viewWorkspaceImage } from "./imageOps.js";
 import { importAttachmentFile } from "./importOps.js";
-import { searchWorkspace } from "./searchOps.js";
-import { getBashJobStatus, runBash, shouldAutoBackgroundBash, startBashJob } from "./bashOps.js";
-import { gitDiff, gitDiffStatus, gitLog, gitStatus } from "./gitOps.js";
+import { searchBackendStatus, searchWorkspace } from "./searchOps.js";
+import { bashRuntimeStatus, runBash } from "./bashOps.js";
+import { gitDiff, gitDiffStats as readGitDiffStats, gitDiffStatus, gitLog, gitRuntimeStatus, gitStatus } from "./gitOps.js";
 import { readAiBridgeContext, readCodexContext, workspaceSummary } from "./workspaceOps.js";
 import { buildProContext, exportProContext } from "./proContext.js";
 import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
 import { runOptiLLMRuntime } from "./optillmRuntime.js";
-import { listCodexSessions, readCodexSession } from "./codexSessions.js";
+import { listCodexSessions, readCodexSession, readCodexSessionAround, searchCodexSession } from "./codexSessions.js";
 import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
 import { hasSecretValue, redactSensitiveText, redactStructured } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
+import { pathRedactions, redactPathsDeep, redactPathsInText } from "./pathLabels.js";
+import { CODEXPRO_VERSION } from "./version.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 
@@ -95,10 +97,8 @@ function validateToolArgs(name: string, options: Record<string, unknown>, args: 
       shape[key] = value as z.ZodTypeAny;
     }
   }
-  const legacyOptiLLMAlias = name === "think" || name === "reasoning_runtime";
-  if (!Object.keys(shape).length) return legacyOptiLLMAlias && args && typeof args === "object" ? args : {};
-  const schema = legacyOptiLLMAlias ? z.object(shape).passthrough() : z.object(shape);
-  const parsed = schema.safeParse(args ?? {});
+  if (!Object.keys(shape).length) return {};
+  const parsed = z.object(shape).safeParse(args ?? {});
   if (parsed.success) return parsed.data;
   const details = parsed.error.issues
     .map((issue) => `${issue.path.length ? issue.path.join(".") : "arguments"}: ${issue.message}`)
@@ -106,7 +106,21 @@ function validateToolArgs(name: string, options: Record<string, unknown>, args: 
   throw new CodexProError(`Invalid arguments for ${name}: ${details}`);
 }
 
-function tagToolResult(result: any, name: string, options: Record<string, unknown>): any {
+function redactAbsolutePaths(result: any, config: CodexProConfig): void {
+  const structured = result.structuredContent;
+  const ordered = pathRedactions(config, structured && typeof structured === "object" ? structured : {});
+  if (!ordered.length) return;
+  if (structured && typeof structured === "object") result.structuredContent = redactPathsDeep(structured, ordered);
+  if (Array.isArray(result.content)) {
+    result.content = result.content.map((item: any) =>
+      item?.type === "text" && typeof item.text === "string"
+        ? { ...item, text: redactPathsInText(item.text, ordered) }
+        : item
+    );
+  }
+}
+
+function tagToolResult(result: any, name: string, options: Record<string, unknown>, config: CodexProConfig): any {
   if (!result || typeof result !== "object") return result;
   const structured = result.structuredContent;
   const base =
@@ -120,6 +134,7 @@ function tagToolResult(result: any, name: string, options: Record<string, unknow
   };
   const meta = (options._meta as Record<string, unknown> | undefined) ?? {};
   result.structuredContent = meta.ui || meta["openai/outputTemplate"] ? compactStructuredContent(tagged) : tagged;
+  if (!config.exposeAbsolutePaths) redactAbsolutePaths(result, config);
   return result;
 }
 
@@ -154,18 +169,10 @@ function usesToolCard(config: CodexProConfig, name: string): boolean {
 }
 
 function descriptorOptionsForConfig(config: CodexProConfig, name: string, options: Record<string, unknown>): Record<string, unknown> {
+  if (usesToolCard(config, name)) return options;
   const meta = { ...((options._meta as Record<string, unknown> | undefined) ?? {}) };
-  if (!usesToolCard(config, name)) {
-    for (const key of OPTIONAL_TOOL_CARD_META) delete meta[key];
-  }
-  if (config.connectionTest) {
-    return {
-      ...options,
-      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
-      _meta: meta
-    };
-  }
-  return usesToolCard(config, name) ? options : { ...options, _meta: meta };
+  for (const key of OPTIONAL_TOOL_CARD_META) delete meta[key];
+  return { ...options, _meta: meta };
 }
 
 function toolCallLoggingEnabled(): boolean {
@@ -284,6 +291,7 @@ function assertWriteToolAllowed(config: CodexProConfig, relPath: string): void {
 }
 
 function registerToolCompat(
+  config: CodexProConfig,
   server: McpServer,
   name: string,
   options: Record<string, unknown>,
@@ -292,11 +300,11 @@ function registerToolCompat(
   const wrapped = async (args: any) => {
     const started = Date.now();
     try {
-      const result = tagToolResult(await handler(args ?? {}), name, options);
+      const result = tagToolResult(await handler(args ?? {}), name, options, config);
       logToolCall(name, result?.isError ? "error" : "ok", started);
       return result;
     } catch (error) {
-      const result = tagToolResult(errorResult(error), name, options);
+      const result = tagToolResult(errorResult(error), name, options, config);
       logToolCall(name, "error", started);
       return result;
     }
@@ -331,8 +339,6 @@ const MINIMAL_TOOL_NAMES = [
   "server_config",
   "codexpro_self_test",
   "optillm_runtime",
-  "reasoning_runtime",
-  "think",
   "open_current_workspace",
   "open_workspace",
   "read",
@@ -341,7 +347,6 @@ const MINIMAL_TOOL_NAMES = [
   "apply_patch",
   "import_file",
   "bash",
-  "bash_job_status",
   "show_changes"
 ] as const;
 
@@ -363,8 +368,6 @@ const FULL_TOOL_NAMES = [
   "server_config",
   "codexpro_self_test",
   "optillm_runtime",
-  "reasoning_runtime",
-  "think",
   "codexpro_inventory",
   "load_skill",
   "list_workspaces",
@@ -381,7 +384,6 @@ const FULL_TOOL_NAMES = [
   "apply_patch",
   "import_file",
   "bash",
-  "bash_job_status",
   "git_status",
   "git_diff",
   "show_changes",
@@ -402,7 +404,6 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   "apply_patch",
   "import_file",
   "bash",
-  "bash_job_status",
   "export_pro_context",
   "handoff_to_agent",
   "handoff_to_codex"
@@ -411,7 +412,7 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
 function codexSessionToolNames(config: CodexProConfig): string[] {
   if (config.codexSessions === "off") return [];
   return config.codexSessions === "read"
-    ? ["codex_sessions", "read_codex_session"]
+    ? ["codex_sessions", "read_codex_session", "search_codex_session", "read_codex_session_around"]
     : ["codex_sessions"];
 }
 
@@ -423,10 +424,8 @@ function toolNamesForMode(config: CodexProConfig): string[] {
         ? [...MINIMAL_TOOL_NAMES]
         : [...STANDARD_TOOL_NAMES];
   if (config.bashMode === "off") {
-    for (const bashTool of ["bash", "bash_job_status"]) {
-      const bashIndex = names.indexOf(bashTool);
-      if (bashIndex !== -1) names.splice(bashIndex, 1);
-    }
+    const bashIndex = names.indexOf("bash");
+    if (bashIndex !== -1) names.splice(bashIndex, 1);
   }
   if (config.writeMode !== "workspace") {
     for (const writeTool of ["write", "edit", "apply_patch", "import_file"]) {
@@ -488,7 +487,7 @@ function registerCodexTool(
 ): void {
   if (!shouldRegisterTool(config, name)) return;
   const validatedHandler: CodexToolHandler = (args) => handler(validateToolArgs(name, options, args));
-  registerToolCompat(server, name, descriptorOptionsForConfig(config, name, options), validatedHandler);
+  registerToolCompat(config, server, name, descriptorOptionsForConfig(config, name, options), validatedHandler);
   rememberRegisteredTool(server, name);
   rememberRegisteredToolHandler(server, name, validatedHandler);
 }
@@ -508,12 +507,12 @@ function serverInstructions(config: CodexProConfig): string {
       : "5. Use bash only for meaningful verification commands such as npm test, npm run build, lint, typecheck, or an existing project script.";
 
   return [
-    "Opti-CodexPro connects ChatGPT to explicitly allowed local development workspaces.",
+    "CodexPro connects ChatGPT to explicitly allowed local development workspaces.",
     "",
     "Preferred workflow:",
     "1. Start with open_current_workspace. Use open_workspace only when the user gives a different allowed root or asks to switch projects; that selection stays active for this MCP session.",
     "2. Follow any AGENTS.md-style instructions returned by the workspace open call before editing files.",
-    "For non-trivial reasoning tasks, optillm_runtime is a web-native OptiLLM controller and never calls Codex CLI or a backend model. If the user does not explicitly name a method, default to action=start with approach=auto. Prefer a task-aware strategy_hint when one clearly fits: cot_reflection for self-checking, self_consistency for math/logic sampling, moa for multi-candidate critique/synthesis, plansearch for complex planning/implementation, rto for code round-trip reconstruction, z3 for equations/constraints/formal solving, leap for few-shot rule induction, cepo for plan refinement, mars for high-difficulty multi-agent reasoning; otherwise use difficulty easy/medium/hard as fallback. Default budget=adaptive: stop early on strong consensus/high-confidence verification and spend extra rounds only on disagreement. Use fast only when latency is the priority and deep only when the user explicitly asks for maximum reasoning. If the user explicitly names a method, honor it. Follow the returned directive with the current webpage model until status=complete.",
+    "For non-trivial reasoning tasks, use optillm_runtime with action=start and approach=auto. Follow its returned webpage-model directive until status=complete; it does not call Codex CLI or a backend model.",
     "3. Inspect with tree, search, and read. Do not use bash for git status, git diff, cat, sed, grep, rg, find, ls, or file reading.",
     editInstruction,
     bashInstruction,
@@ -693,26 +692,28 @@ async function applyWorkspacePatch(
       assertWriteToolAllowed(config, touchedPath);
     }
 
-    const check = spawnSync("git", ["apply", "--check", "--whitespace=nowarn"], {
+    const check = spawnSync("git", ["apply", "--check", "--verbose", "--whitespace=nowarn"], {
       cwd: workspace.root,
       input: patch,
       encoding: "utf8",
       maxBuffer: config.maxOutputBytes,
       env: { ...process.env, NO_COLOR: "1" }
     });
-    if (check.error || check.status !== 0) {
-      throw new CodexProError(redactSensitiveText(check.stderr?.trim() || check.stdout?.trim() || check.error?.message || "git apply --check failed"));
+    const checkOutput = [check.stdout?.trim(), check.stderr?.trim()].filter(Boolean).join("\n");
+    if (check.error || check.status !== 0 || /(?:^|\n)Skipped patch\b/i.test(checkOutput)) {
+      throw new CodexProError(redactSensitiveText(checkOutput || check.error?.message || "git apply --check failed"));
     }
 
-    const applied = spawnSync("git", ["apply", "--whitespace=nowarn"], {
+    const applied = spawnSync("git", ["apply", "--verbose", "--whitespace=nowarn"], {
       cwd: workspace.root,
       input: patch,
       encoding: "utf8",
       maxBuffer: config.maxOutputBytes,
       env: { ...process.env, NO_COLOR: "1" }
     });
-    if (applied.error || applied.status !== 0) {
-      throw new CodexProError(redactSensitiveText(applied.stderr?.trim() || applied.stdout?.trim() || applied.error?.message || "git apply failed"));
+    const appliedOutput = [applied.stdout?.trim(), applied.stderr?.trim()].filter(Boolean).join("\n");
+    if (applied.error || applied.status !== 0 || /(?:^|\n)Skipped patch\b/i.test(appliedOutput)) {
+      throw new CodexProError(redactSensitiveText(appliedOutput || applied.error?.message || "git apply failed"));
     }
 
     const diff = redactSensitiveText(patch.trimEnd());
@@ -951,140 +952,14 @@ const BASH_ANNOTATIONS = { readOnlyHint: false, openWorldHint: true, destructive
 const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: false };
 const RUNTIME_STATE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: false };
 
-function legacyOptiLLMTask(args: any): string {
-  const directKeys = [
-    "task", "prompt", "query", "problem", "question", "input", "text", "thought",
-    "message", "content", "instruction", "request", "initial_query", "user_prompt", "goal"
-  ];
-  for (const key of directKeys) {
-    const value = args?.[key];
-    if (typeof value === "string" && value.trim()) return value.trim();
-  }
-  if (Array.isArray(args?.messages)) {
-    for (let i = args.messages.length - 1; i >= 0; i -= 1) {
-      const item = args.messages[i];
-      if (item && typeof item === "object" && String(item.role ?? "").toLowerCase() === "user") {
-        const content = item.content;
-        if (typeof content === "string" && content.trim()) return content.trim();
-      }
-    }
-  }
-  return "";
-}
-
-function legacyOptiLLMApproach(args: any): string {
-  const raw = String(args?.approach ?? args?.method ?? args?.mode ?? args?.strategy ?? args?.algorithm ?? "").toLowerCase();
-  if (raw.includes("self_consistency") || raw.includes("self-consistency")) return "self_consistency";
-  if (raw.includes("cot_reflection") || raw.includes("reflection")) return "cot_reflection";
-  if (raw.includes("plansearch") || raw.includes("plan_search")) return "plansearch";
-  if (raw === "z3" || raw.includes("sympy")) return "z3";
-  if (raw === "rto" || raw.includes("round_trip")) return "rto";
-  if (raw.includes("leap")) return "leap";
-  if (raw === "moa" || raw.includes("mixture_of_agents")) return "moa";
-  if (raw.includes("cepo")) return "cepo";
-  if (raw.includes("mars")) return "mars";
-  if (raw.includes("bon") || raw.includes("best_of_n") || raw.includes("best-of-n")) return "bon";
-  if (raw.includes("re2") || raw.includes("reread") || raw.includes("re-read")) return "re2";
-  return "auto";
-}
-
-function legacyOptiLLMDifficulty(args: any): "easy" | "medium" | "hard" | undefined {
-  const raw = String(args?.difficulty ?? args?.level ?? args?.complexity ?? "").toLowerCase();
-  if (raw === "easy" || raw === "low") return "easy";
-  if (raw === "medium" || raw === "moderate" || raw === "mid") return "medium";
-  if (raw === "hard" || raw === "high" || raw === "difficult") return "hard";
-  return undefined;
-}
-
-function normalizeLegacyOptiLLMArgs(args: any): any {
-  const rawAction = String(args?.action ?? args?.op ?? "").toLowerCase().replace(/[\s-]+/g, "_");
-  const runtimeId = String(args?.runtime_id ?? args?.reasoning_id ?? args?.session_id ?? "").trim();
-
-  if (runtimeId && ["state", "status", "inspect", "get"].includes(rawAction)) {
-    return { action: "state", runtime_id: runtimeId };
-  }
-  if (runtimeId && ["cancel", "abort", "stop", "reset"].includes(rawAction)) {
-    return { action: "cancel", runtime_id: runtimeId };
-  }
-
-  const answerCandidate =
-    typeof args?.answer === "string" ? args.answer :
-    typeof args?.result === "string" ? args.result :
-    typeof args?.response === "string" ? args.response :
-    typeof args?.output === "string" ? args.output :
-    typeof args?.content === "string" && runtimeId ? args.content :
-    undefined;
-
-  if (runtimeId && (
-    answerCandidate !== undefined ||
-    typeof args?.rating === "number" ||
-    Array.isArray(args?.ratings) ||
-    typeof args?.selected_index === "number" ||
-    typeof args?.need_more === "boolean" ||
-    typeof args?.assessment === "string" ||
-    ["submit", "continue", "step", "advance", "finish", "verify", "reflect", "act"].includes(rawAction)
-  )) {
-    const normalized: any = { action: "submit", runtime_id: runtimeId };
-    if (answerCandidate !== undefined) normalized.answer = answerCandidate;
-    if (typeof args?.rating === "number") normalized.rating = args.rating;
-    if (Array.isArray(args?.ratings)) normalized.ratings = args.ratings;
-    if (typeof args?.selected_index === "number") normalized.selected_index = args.selected_index;
-    if (typeof args?.need_more === "boolean") normalized.need_more = args.need_more;
-    if (typeof args?.assessment === "string") normalized.assessment = args.assessment.toUpperCase();
-    if (typeof args?.confidence === "number") normalized.confidence = args.confidence;
-    if (typeof args?.report === "string") normalized.report = args.report;
-    if (Array.isArray(args?.issues)) normalized.issues = args.issues;
-    return normalized;
-  }
-
-  const task = legacyOptiLLMTask(args);
-  if (!task) {
-    if (runtimeId) return { action: "state", runtime_id: runtimeId };
-    throw new CodexProError(
-      "Legacy OptiLLM alias needs a task. Supply task, prompt, query, problem, question, or initial_query."
-    );
-  }
-
-  const normalized: any = {
-    action: "start",
-    approach: legacyOptiLLMApproach(args),
-    task
-  };
-  const difficulty = legacyOptiLLMDifficulty(args);
-  if (difficulty) normalized.difficulty = difficulty;
-  const budget = String(args?.budget ?? "").toLowerCase();
-  if (["fast", "adaptive", "deep"].includes(budget)) normalized.budget = budget;
-  if (typeof args?.strategy_hint === "string" && args.strategy_hint.trim()) normalized.strategy_hint = args.strategy_hint.trim();
-  if (typeof args?.system_prompt === "string") normalized.system_prompt = args.system_prompt;
-  if (Number.isInteger(args?.n)) normalized.n = args.n;
-  return normalized;
-}
-
-function legacyOptiLLMText(result: any, aliasName: string): string {
-  const lines = [
-    `# ${aliasName} → Web-Native OptiLLM`,
-    "",
-    `Approach: ${String(result.approach ?? result.auto_selected_approach ?? "")}`,
-    `Status: ${String(result.status ?? "")}`,
-    `Stage: ${String(result.stage ?? "")}`,
-    `Runtime: ${String(result.runtime_id ?? "")}`,
-    "Codex CLI used: false",
-    "Backend model calls: 0"
-  ];
-  if (result.status === "needs_model") {
-    lines.push("", String(result.directive ?? ""), "", "Use structuredContent.prompt for this webpage-model pass, then call this alias again with runtime_id and the requested submission fields.");
-  } else if (typeof result.result === "string" && result.result) {
-    lines.push("", result.result);
-  }
-  return lines.join("\n");
-}
-
-export function createCodexProServer(config: CodexProConfig): McpServer {
-  const workspaces = new WorkspaceManager(config);
+export function createCodexProServer(
+  config: CodexProConfig,
+  options: { workspaceRegistry?: WorkspaceRegistry } = {}
+): McpServer {
+  const workspaces = new WorkspaceManager(config, options.workspaceRegistry);
   const reviewCheckpoints = new Map<string, string>();
-
   const guard = new PathGuard(config);
-  const server = new McpServer({ name: "opti-codexpro", version: "0.30.0" }, { instructions: serverInstructions(config) });
+  const server = new McpServer({ name: "CodexPro", version: CODEXPRO_VERSION }, { instructions: serverInstructions(config) });
   registeredToolNamesByServer.set(server as object, []);
   registerToolCardResource(server, config);
 
@@ -1093,7 +968,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     server,
     SUPERTOOL_NAME,
     {
-      title: "Opti-CodexPro Supertool",
+      title: "CodexPro Supertool",
       description:
         "Stable wrapper for advanced ChatGPT connector setups. Pass action plus args to call an already-registered CodexPro tool without changing the visible schema; it cannot call tools disabled by the current mode.",
       inputSchema: {
@@ -1112,7 +987,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       const names = registeredToolNames(server).filter((name) => name !== SUPERTOOL_NAME);
       if (action === "list_actions" || action === "help") {
         const text = [
-          "# Opti-CodexPro Supertool",
+          "# CodexPro Supertool",
           "",
           "Use `codexpro` only when a stable wrapper is useful for ChatGPT connector caching or custom workflows. The explicit tools remain the preferred default because they give clearer descriptions and validation.",
           "",
@@ -1188,6 +1063,12 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       }
     },
     async () => {
+      const searchBackend = await searchBackendStatus();
+      const bashRuntime = bashRuntimeStatus(config);
+      const gitRuntime = { ...gitRuntimeStatus(config), bash_runtime: bashRuntime.selected_runtime ?? config.bashRuntime };
+      const safeSearchBackend = config.exposeAbsolutePaths || !searchBackend.ripgrep_path
+        ? searchBackend
+        : { ...searchBackend, ripgrep_path: "[redacted]" };
       const safeConfig = {
         defaultRoot: config.defaultRoot,
         allowedRoots: config.allowedRoots,
@@ -1197,12 +1078,16 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         authEnabled: Boolean(config.authToken),
         bashMode: config.bashMode,
         bashTranscript: config.bashTranscript,
+        bashRuntime: config.bashRuntime,
+        bashExecutable: config.bashExecutable ?? null,
+        gitExecutable: config.gitExecutable ?? null,
         bashSessionId: config.bashSessionId ?? null,
         requireBashSession: config.requireBashSession,
         codexSessions: config.codexSessions,
         codexDir: config.codexDir,
         writeMode: config.writeMode,
         toolMode: config.toolMode,
+        exposeAbsolutePaths: config.exposeAbsolutePaths,
         toolCards: config.toolCards,
         connectionTest: config.connectionTest,
         analysisEnabled: config.analysisEnabled,
@@ -1214,6 +1099,11 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         maxImportBytes: config.maxImportBytes,
         maxOutputBytes: config.maxOutputBytes,
         maxSearchResults: config.maxSearchResults,
+        schema_timeout_max_ms: MAX_BASH_TIMEOUT_MS,
+        configured_timeout_max_ms: config.maxBashTimeoutMs,
+        bash_runtime: bashRuntime,
+        git_runtime: gitRuntime,
+        search_backend: safeSearchBackend,
         blockedGlobs: config.blockedGlobs,
         registeredTools: registeredToolNames(server),
         registeredToolCount: registeredToolNames(server).length
@@ -1251,6 +1141,8 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       const checks: Array<{ name: string; status: "pass" | "warn" | "fail"; detail: string }> = [];
       const filesTouched: string[] = [];
       const probePath = `${config.contextDir}/codexpro-self-test.md`;
+      const contextProbeCandidates = ["AGENTS.md", "agents.md", "README.md", "README.MD", "CONTRIBUTING.md", "package.json"];
+      let contextProbePath: string | undefined;
 
       const check = (name: string, status: "pass" | "warn" | "fail", detail: string) => {
         checks.push({ name, status, detail: cleanOneLine(detail, detail, 260) });
@@ -1260,6 +1152,24 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       check("tool mode", config.toolMode === "full" ? "pass" : "warn", `${config.toolMode}; expected tools: ${toolNamesForMode(config).length}`);
       check("write mode", config.writeMode === "off" ? "warn" : "pass", config.writeMode);
       check("bash mode", config.bashMode === "full" ? "warn" : "pass", config.bashMode);
+      const bashRuntime = bashRuntimeStatus(config);
+      const gitRuntime = gitRuntimeStatus(config);
+      check("bash runtime", config.bashMode === "off" ? "warn" : bashRuntime.available ? "pass" : "fail", JSON.stringify(bashRuntime));
+      check("git runtime", gitRuntime.available ? "pass" : "fail", JSON.stringify(gitRuntime));
+      const mixedWindowsToolchain = process.platform === "win32" && bashRuntime.selected_runtime === "wsl";
+      const alignedWindowsToolchain = !mixedWindowsToolchain && (
+        process.platform !== "win32" ||
+        (bashRuntime.source === "git-for-windows" && gitRuntime.source === "git-for-windows")
+      );
+      check(
+        "bash/git toolchain",
+        config.bashMode === "off" ? "warn" : mixedWindowsToolchain ? "warn" : alignedWindowsToolchain ? "pass" : "warn",
+        mixedWindowsToolchain
+          ? "Bash is running through explicit WSL while Git tools use the Windows process; set a matching Git executable or use native-bash."
+          : alignedWindowsToolchain
+            ? "Bash and Git use the same native toolchain."
+            : "Bash and Git executables could not be proven to share a toolchain; inspect server_config and set CODEXPRO_GIT_EXECUTABLE if needed."
+      );
       check(
         "http auth",
         "pass",
@@ -1301,12 +1211,78 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         check("git status", "fail", errorText(error));
       }
 
+      try {
+        const searchBackend = await searchBackendStatus();
+        if (searchBackend.ripgrep_available) {
+          const version = searchBackend.ripgrep_version ? ` (${searchBackend.ripgrep_version})` : "";
+          const location = config.exposeAbsolutePaths && searchBackend.ripgrep_path ? ` at ${searchBackend.ripgrep_path}` : "";
+          check("search backend", "pass", `ripgrep${version}${location}`);
+        } else {
+          check("search backend", "warn", searchBackend.reason ?? "ripgrep unavailable; Node fallback active");
+        }
+      } catch (error) {
+        check("search backend", "warn", `search backend detection unavailable: ${errorText(error)}`);
+      }
+
+      for (const candidate of contextProbeCandidates) {
+        try {
+          const resolved = guard.resolve(workspace, candidate);
+          const stat = await fsp.stat(resolved.absPath);
+          if (!stat.isFile()) continue;
+          await guard.assertTextFile(resolved.absPath, config.maxReadBytes);
+          contextProbePath = resolved.relPath;
+          break;
+        } catch {
+          // Keep looking for a small existing safe text file.
+        }
+      }
+      if (!contextProbePath) {
+        try {
+          const candidates = await listFiles(guard, workspace, { maxFiles: 200 });
+          for (const candidate of candidates) {
+            const resolved = guard.resolve(workspace, candidate);
+            const stat = await fsp.stat(resolved.absPath);
+            if (!stat.isFile() || stat.size > config.maxReadBytes) continue;
+            await guard.assertTextFile(resolved.absPath, config.maxReadBytes);
+            contextProbePath = resolved.relPath;
+            break;
+          }
+        } catch {
+          // Report no usable candidate below.
+        }
+      }
+
       if (parseBool(args.write_probe, true)) {
         if (config.writeMode === "off") {
           check("write/edit probe", "warn", "skipped because CODEXPRO_WRITE_MODE=off");
         } else {
+          const probeResolved = guard.resolve(workspace, probePath, { forWrite: true });
+          const probeParent = path.dirname(probeResolved.absPath);
+          const probeParentExisted = await fsp.stat(probeParent).then((stat) => stat.isDirectory()).catch(() => false);
+          let originalProbe:
+            | { bytes: Buffer; mode: number; atimeMs: number; mtimeMs: number }
+            | { nonFile: true }
+            | undefined;
+          try {
+            const stat = await fsp.lstat(probeResolved.absPath);
+            if (stat.isFile()) {
+              originalProbe = {
+                bytes: await fsp.readFile(probeResolved.absPath),
+                mode: stat.mode & 0o7777,
+                atimeMs: stat.atimeMs,
+                mtimeMs: stat.mtimeMs
+              };
+            } else {
+              originalProbe = { nonFile: true };
+            }
+          } catch (error) {
+            const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+            if (code !== "ENOENT") throw error;
+          }
+          let probeAttempted = false;
           try {
             assertWriteToolAllowed(config, probePath);
+            probeAttempted = true;
             const content = [
               "# CodexPro Self Test",
               "",
@@ -1329,6 +1305,24 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
             );
           } catch (error) {
             check("write/edit probe", "fail", errorText(error));
+          } finally {
+            if (probeAttempted) {
+              try {
+                if (originalProbe && "nonFile" in originalProbe) {
+                  // The probe must never replace a pre-existing non-file path.
+                } else if (originalProbe) {
+                  await fsp.writeFile(probeResolved.absPath, originalProbe.bytes);
+                  await fsp.chmod(probeResolved.absPath, originalProbe.mode);
+                  await fsp.utimes(probeResolved.absPath, originalProbe.atimeMs / 1000, originalProbe.mtimeMs / 1000);
+                } else {
+                  await fsp.rm(probeResolved.absPath, { force: true });
+                  if (!probeParentExisted) await fsp.rmdir(probeParent).catch(() => {});
+                }
+                check("write probe cleanup", "pass", `restored ${probePath}`);
+              } catch (error) {
+                check("write probe cleanup", "fail", errorText(error));
+              }
+            }
           }
         }
       } else {
@@ -1337,12 +1331,12 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
 
       if (parseBool(args.pro_context_probe, true)) {
         try {
-          if (!filesTouched.includes(probePath)) {
-            check("selected-only pro context", "warn", "skipped because write probe did not create the selected file");
+          if (!contextProbePath) {
+            check("selected-only pro context", "warn", "no existing safe text file was available for the in-memory probe");
           } else {
             const context = await buildProContext(config, guard, workspace, {
               title: "CodexPro Self Test Context",
-              selectedPaths: [probePath],
+              selectedPaths: [contextProbePath],
               includeImportantFiles: false,
               includeChangedFiles: false,
               includeDiff: false,
@@ -1350,11 +1344,11 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
               maxFiles: 4,
               maxTotalBytes: 80_000
             });
-            const exactOnly = context.filesIncluded.length === 1 && context.filesIncluded[0] === probePath;
+            const exactOnly = context.filesIncluded.length === 1 && context.filesIncluded[0] === contextProbePath;
             check(
               "selected-only pro context",
               exactOnly ? "pass" : "fail",
-              exactOnly ? `included only ${probePath}` : `included ${context.filesIncluded.join(", ") || "no files"}`
+              exactOnly ? `included only ${contextProbePath}` : `included ${context.filesIncluded.join(", ") || "no files"}`
             );
           }
         } catch (error) {
@@ -1371,15 +1365,41 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
           } else {
             const bashProbeOptions = { timeoutMs: 10_000, sessionId: config.bashSessionId };
             const pwd = await runBash(config, guard, workspace, "pwd", bashProbeOptions);
+            const shellTools = ["node", "npm", "npx", "git", "rg"];
+            const shellToolDetails: string[] = [];
+            const shellToolVersions = new Map<string, string>();
+            const missingShellTools: string[] = [];
+            for (const tool of shellTools) {
+              const location = await runBash(config, guard, workspace, `command -v ${tool}`, bashProbeOptions);
+              const version = await runBash(config, guard, workspace, `${tool} --version`, bashProbeOptions);
+              const locationText = location.exitCode === 0 ? location.stdout.trim().split(/\r?\n/)[0] : "unavailable";
+              const versionText = version.exitCode === 0 ? version.stdout.trim().split(/\r?\n/)[0] : "unavailable";
+              if (version.exitCode === 0) shellToolVersions.set(tool, versionText);
+              if (location.exitCode !== 0 || version.exitCode !== 0) missingShellTools.push(tool);
+              shellToolDetails.push(`${tool}: ${locationText} ${versionText}`);
+            }
+            check("bash cwd", pwd.exitCode === 0 ? "pass" : "warn", pwd.stdout.trim() || "unavailable");
+            check(
+              "bash toolchain",
+              missingShellTools.length ? "warn" : "pass",
+              `${shellToolDetails.join("; ")}${missingShellTools.length ? `; missing: ${missingShellTools.join(", ")}` : ""}`
+            );
+            const shellGit = shellToolVersions.get("git");
+            const dedicatedGit = gitRuntime.version;
+            if (shellGit && dedicatedGit && shellGit !== dedicatedGit) {
+              check("git version alignment", "warn", `bash=${shellGit}; dedicated=${dedicatedGit}`);
+            } else {
+              check("git version alignment", "pass", shellGit && dedicatedGit ? `both report ${dedicatedGit}` : "version comparison unavailable");
+            }
             if (config.bashMode === "safe") {
               try {
                 await runBash(config, guard, workspace, "ls $HOME", bashProbeOptions);
                 check("bash policy", "fail", "safe bash allowed environment expansion unexpectedly");
               } catch {
-                check("bash policy", pwd.exitCode === 0 ? "pass" : "warn", "safe bash allowed pwd and blocked environment expansion");
+              check("bash policy", pwd.exitCode === 0 ? "pass" : "warn", `safe bash allowed pwd and blocked environment expansion (${pwd.bashRuntime})`);
               }
             } else {
-              check("bash policy", pwd.exitCode === 0 ? "warn" : "fail", "full bash is enabled; use only for trusted local repos");
+              check("bash policy", pwd.exitCode === 0 ? "warn" : "fail", `full bash is enabled; use only for trusted local repos (${pwd.bashRuntime})`);
             }
           }
         } catch (error) {
@@ -1507,7 +1527,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         ].join("\n");
       } else if (result.status === "needs_model") {
         text = [
-          "# Web-Native OptiLLM — model step required",
+          "# Web-Native OptiLLM - model step required",
           "",
           `Approach: ${String(result.approach ?? args.approach ?? "")}`,
           `Stage: ${String(result.stage ?? "")}`,
@@ -1532,92 +1552,6 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       return textResult(text, { root: workspace.root, ...result });
     }
   );
-
-
-  const legacyOptiLLMInputSchema = {
-    workspace_id: z.string().optional(),
-    action: z.string().optional(),
-    op: z.string().optional(),
-    task: z.string().max(200000).optional(),
-    prompt: z.string().max(200000).optional(),
-    query: z.string().max(200000).optional(),
-    problem: z.string().max(200000).optional(),
-    question: z.string().max(200000).optional(),
-    input: z.string().max(200000).optional(),
-    text: z.string().max(200000).optional(),
-    thought: z.string().max(200000).optional(),
-    message: z.string().max(200000).optional(),
-    content: z.string().max(200000).optional(),
-    instruction: z.string().max(200000).optional(),
-    request: z.string().max(200000).optional(),
-    initial_query: z.string().max(200000).optional(),
-    user_prompt: z.string().max(200000).optional(),
-    goal: z.string().max(200000).optional(),
-    approach: z.string().max(128).optional(),
-    method: z.string().max(128).optional(),
-    mode: z.string().max(128).optional(),
-    strategy: z.string().max(128).optional(),
-    algorithm: z.string().max(128).optional(),
-    difficulty: z.string().max(64).optional(),
-    budget: z.string().max(64).optional(),
-    strategy_hint: z.string().max(128).optional(),
-    level: z.string().max(64).optional(),
-    complexity: z.string().max(64).optional(),
-    runtime_id: z.string().max(256).optional(),
-    reasoning_id: z.string().max(256).optional(),
-    session_id: z.string().max(256).optional(),
-    answer: z.string().max(200000).optional(),
-    result: z.string().max(200000).optional(),
-    response: z.string().max(200000).optional(),
-    output: z.string().max(200000).optional(),
-    rating: z.number().optional(),
-    ratings: z.array(z.number()).max(32).optional(),
-    selected_index: z.number().int().optional(),
-    need_more: z.boolean().optional(),
-    assessment: z.string().max(64).optional(),
-    confidence: z.number().optional(),
-    report: z.string().max(30000).optional(),
-    issues: z.array(z.string().max(4000)).max(12).optional(),
-    system_prompt: z.string().max(50000).optional(),
-    n: z.number().int().min(1).max(32).optional(),
-    messages: z.array(z.any()).optional()
-  };
-
-  for (const aliasName of ["reasoning_runtime", "think"] as const) {
-    registerCodexTool(
-      config,
-      server,
-      aliasName,
-      {
-        title: aliasName === "think" ? "Think (OptiLLM Alias)" : "Reasoning Runtime (OptiLLM Alias)",
-        description:
-          "Backward-compatible alias for the live Web-Native OptiLLM runtime. Old sessions may call this tool name. " +
-          "It accepts legacy task/prompt/query/problem fields and legacy reasoning_id, then routes to OptiLLM Auto unless " +
-          "RE2/BoN/MARS is explicitly requested. No Codex CLI or backend model is used.",
-        inputSchema: legacyOptiLLMInputSchema,
-        annotations: RUNTIME_STATE_ANNOTATIONS,
-        _meta: {
-          "openai/toolInvocation/invoking": "Routing legacy reasoning call to OptiLLM...",
-          "openai/toolInvocation/invoked": "OptiLLM alias step complete"
-        }
-      },
-      async (args) => {
-        const workspace = workspaces.getWorkspace(args.workspace_id);
-        const normalized = normalizeLegacyOptiLLMArgs(args);
-        const result = await runOptiLLMRuntime(normalized);
-        const reasoningId = String(result.runtime_id ?? args.reasoning_id ?? "");
-        return textResult(legacyOptiLLMText(result, aliasName), {
-          root: workspace.root,
-          ...result,
-          alias_of: "optillm_runtime",
-          legacy_alias: aliasName,
-          reasoning_id: reasoningId || undefined,
-          codex_cli_used: false,
-          backend_model_calls: 0
-        });
-      }
-    );
-  }
 
   registerCodexTool(
     config,
@@ -2358,7 +2292,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     {
       title: "Bash",
       description:
-        "Run one verification or project command in the workspace. execution_mode defaults to auto: potentially long batch, build, or pipeline jobs are started as detached jobs instead of being killed by the MCP request timeout; poll them with bash_job_status. Use foreground for short commands that must return inline.",
+        "Run one allowlisted verification command in the workspace, such as tests, build, lint, typecheck, or a project script. Do not use for git status/diff or file inspection; use show_changes, tree, search, and read instead. Do not chain commands with &&, pipes, redirects, or shell file readers.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
         command: z.string().describe("Command to run."),
@@ -2368,132 +2302,26 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
           .number()
           .int()
           .min(1000)
-          .max(config.maxBashTimeoutMs)
+          .max(MAX_BASH_TIMEOUT_MS)
           .optional()
-          .describe(`Foreground timeout in milliseconds. Default: 30000. Max: ${config.maxBashTimeoutMs}. In auto mode, long-running commands may be detached instead of timed out.`),
-        execution_mode: z
-          .enum(["auto", "foreground", "background"])
-          .optional()
-        .describe("Default: auto. auto detaches long-running batch commands and returns a job id; foreground preserves the hard timeout behavior; background always detaches.")
+          .describe(`Timeout in milliseconds. Default: 30000. Max: ${config.maxBashTimeoutMs}.`)
       },
       annotations: BASH_ANNOTATIONS,
       _meta: {
         ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Running bash command...",
-        "openai/toolInvocation/invoked": "Bash command started"
+        "openai/toolInvocation/invoked": "Bash command finished"
       }
     },
     async (args) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
-      const command = String(args.command ?? "");
-      const executionMode = String(args.execution_mode ?? "auto");
-      const useBackground =
-        executionMode === "background" ||
-        (executionMode === "auto" && shouldAutoBackgroundBash(command, args.timeout_ms));
-      if (useBackground) {
-        const result = startBashJob(config, guard, workspace, command, {
-          cwd: args.cwd,
-          sessionId: args.session_id
-        });
-        const summary = [
-          `Background bash job started: ${result.jobId}`,
-          `PID: ${result.pid}`,
-          `CWD: ${result.cwd}`,
-          `stdout: ${result.stdoutPath}`,
-          `stderr: ${result.stderrPath}`,
-          "Poll with bash_job_status until state is completed or failed."
-        ].join("\\n");
-        return textResult(summary, {
-          workspace_id: workspace.id,
-          root: workspace.root,
-          background: true,
-          execution_mode: executionMode,
-          job_id: result.jobId,
-          pid: result.pid,
-          state: result.state,
-          command: result.command,
-          cwd: result.cwd,
-          started_at_ms: result.startedAtMs,
-          stdout_path: result.stdoutPath,
-          stderr_path: result.stderrPath,
-          bash_session_id: result.bashSessionId ?? null
-        });
-      }
-
-      const result = await runBash(config, guard, workspace, command, {
+      const result = await runBash(config, guard, workspace, String(args.command ?? ""), {
         cwd: args.cwd,
         timeoutMs: args.timeout_ms,
         sessionId: args.session_id
       });
       const text = bashTextResult(config, result);
-      return textResult(text, {
-        workspace_id: workspace.id,
-        root: workspace.root,
-        background: false,
-        execution_mode: executionMode,
-        ...result,
-        bash_session_id: result.bashSessionId ?? null
-      });
-    }
-  );
-
-  registerCodexTool(
-    config,
-    server,
-    "bash_job_status",
-    {
-      title: "Bash Job Status",
-      description:
-        "Poll a detached bash job started by bash execution_mode=auto/background. Returns process state, exit code when finished, and tails of stdout/stderr. Use max_wait_seconds to long-poll within the current turn instead of repeatedly launching the command.",
-      inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
-        job_id: z.string().describe("Job id returned by bash."),
-        max_wait_seconds: z.number().int().min(0).max(60).optional().describe("Long-poll for up to this many seconds before returning. Default: 0."),
-        poll_ms: z.number().int().min(250).max(5000).optional().describe("Poll interval while waiting. Default: 1000 ms."),
-        tail_bytes: z.number().int().min(1000).max(config.maxOutputBytes).optional().describe("Maximum bytes retained from each log tail. Default: 20000.")
-      },
-      annotations: READ_ONLY_ANNOTATIONS,
-      _meta: {
-        ...toolCardMeta(),
-        "openai/toolInvocation/invoking": "Checking background job...",
-        "openai/toolInvocation/invoked": "Background job status ready"
-      }
-    },
-    async (args) => {
-      const workspace = workspaces.getWorkspace(args.workspace_id);
-      const maxWaitSeconds = Math.max(0, Math.min(Number(args.max_wait_seconds ?? 0), 60));
-      const pollMs = Math.max(250, Math.min(Number(args.poll_ms ?? 1000), 5000));
-      const deadline = Date.now() + maxWaitSeconds * 1000;
-      let result = getBashJobStatus(config, workspace, String(args.job_id ?? ""), Number(args.tail_bytes ?? 20_000));
-      while (result.state === "running" && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, Math.max(0, deadline - Date.now()))));
-        result = getBashJobStatus(config, workspace, String(args.job_id ?? ""), Number(args.tail_bytes ?? 20_000));
-      }
-      const summary = [
-        `Bash job ${result.jobId}: ${result.state}`,
-        `PID: ${result.pid}`,
-        `Exit code: ${result.exitCode ?? "n/a"}`,
-        `Duration: ${result.durationMs} ms`,
-        result.stdout ? `stdout tail:\\n${result.stdout}` : "stdout tail: <empty>",
-        result.stderr ? `stderr tail:\\n${result.stderr}` : "stderr tail: <empty>"
-      ].join("\\n");
-      return textResult(summary, {
-        workspace_id: workspace.id,
-        root: workspace.root,
-        job_id: result.jobId,
-        state: result.state,
-        pid: result.pid,
-        command: result.command,
-        cwd: result.cwd,
-        exit_code: result.exitCode,
-        duration_ms: result.durationMs,
-        stdout: result.stdout,
-        stderr: result.stderr,
-        truncated: result.truncated,
-        stdout_path: result.stdoutPath,
-        stderr_path: result.stderrPath,
-        bash_session_id: result.bashSessionId ?? null
-      });
+      return textResult(text, { workspace_id: workspace.id, root: workspace.root, ...result, bash_session_id: result.bashSessionId ?? null });
     }
   );
 
@@ -2555,10 +2383,20 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     },
     async (args) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
-      const rawDiff = normalizeGitOutput(gitDiff(config, guard, workspace, args.path, parseBool(args.staged, false)));
-      const diffError = rawDiff && looksLikeGitError(rawDiff) ? rawDiff : "";
-      const stats = diffError ? { additions: 0, deletions: 0, changed: false } : diffStats(rawDiff);
+      const staged = parseBool(args.staged, false);
       const includeDiff = parseBool(args.include_diff, true);
+      let rawDiff = "";
+      let diffError = "";
+      let stats: { additions: number; deletions: number; changed: boolean };
+      if (includeDiff) {
+        rawDiff = normalizeGitOutput(gitDiff(config, guard, workspace, args.path, staged));
+        diffError = rawDiff && looksLikeGitError(rawDiff) ? rawDiff : "";
+        stats = diffError ? { additions: 0, deletions: 0, changed: false } : diffStats(rawDiff);
+      } else {
+        const statsOnly = readGitDiffStats(config, guard, workspace, args.path, staged);
+        diffError = statsOnly.error ?? "";
+        stats = { additions: statsOnly.additions, deletions: statsOnly.deletions, changed: statsOnly.changed };
+      }
       const text = diffError
         ? diffError
         : includeDiff
@@ -2568,7 +2406,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
             "",
             `Workspace: ${workspace.root}`,
             `Path: ${args.path ?? "workspace diff"}`,
-            `Staged: ${parseBool(args.staged, false)}`,
+            `Staged: ${staged}`,
             `Diff stats: +${stats.additions} -${stats.deletions}`,
             "",
             "Raw diff omitted by include_diff=false."
@@ -2577,13 +2415,13 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         workspace_id: workspace.id,
         root: workspace.root,
         path: args.path ?? "workspace diff",
-        staged: parseBool(args.staged, false),
+        staged,
         include_diff: includeDiff,
         diff_error: diffError || undefined,
         additions: stats.additions,
         deletions: stats.deletions,
         changed: !diffError && stats.changed,
-        diff: diffError || includeDiff ? rawDiff : ""
+        diff: diffError || (includeDiff ? rawDiff : "")
       });
     }
   );
@@ -2776,7 +2614,25 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
 
       const stateRel = `${config.contextDir}/handoff-run-state.json`;
       const contextPrefix = `${config.contextDir.replace(/\/+$/, "")}/`;
-      const terminalStates = new Set(["completed", "failed", "timed_out"]);
+      const terminalStates = new Set(["completed", "failed", "timed_out", "interrupted", "orphaned"]);
+      const processAlive = (pid: unknown): boolean | undefined => {
+        if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return undefined;
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch (error: any) {
+          return error?.code === "ESRCH" ? false : true;
+        }
+      };
+      const effectiveState = (state: Record<string, any> | undefined): string | undefined => {
+        if (!state) return undefined;
+        if (state.state === "running" || state.state === "interrupting") {
+          const parentAlive = processAlive(state.pid);
+          const childAlive = processAlive(state.child_pid);
+          if (parentAlive === false && childAlive !== true) return "orphaned";
+        }
+        return typeof state.state === "string" ? state.state : undefined;
+      };
 
       const readState = async (): Promise<Record<string, any> | undefined> => {
         try {
@@ -2791,7 +2647,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       const isAwaited = (state: Record<string, any> | undefined): boolean =>
         Boolean(
           state &&
-            terminalStates.has(state.state) &&
+            terminalStates.has(effectiveState(state) ?? "") &&
             (!expectedPlanHash || state.plan_hash === expectedPlanHash) &&
             (sinceIteration === undefined || (typeof state.iteration === "number" && state.iteration > sinceIteration))
         );
@@ -2804,10 +2660,14 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       }
 
       const awaitedTerminal = isAwaited(state);
-      const awaitedCompleted = awaitedTerminal && state?.state === "completed";
+      const resolvedState = effectiveState(state);
+      const inFlightState = state?.state === "running" || state?.state === "interrupting";
+      const recordedPidAlive = inFlightState ? processAlive(state?.pid) : undefined;
+      const recordedChildPidAlive = inFlightState ? processAlive(state?.child_pid) : undefined;
+      const awaitedCompleted = awaitedTerminal && resolvedState === "completed";
       const planHashMismatch = Boolean(expectedPlanHash && state && state.plan_hash !== expectedPlanHash);
       const reportedState = awaitedTerminal
-        ? String(state?.state)
+        ? String(resolvedState)
         : state
           ? state.state === "running" || planHashMismatch || sinceIteration !== undefined
             ? "running"
@@ -2839,13 +2699,23 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         awaited_completed: awaitedCompleted,
         awaited_terminal: awaitedTerminal,
         succeeded: awaitedCompleted,
+        reconcile_required: resolvedState === "orphaned" || Boolean(state?.reconcile_required),
         state_file: stateRel,
         ...(state ? { run_state: state.state } : {}),
+        ...(resolvedState && resolvedState !== state?.state ? { effective_run_state: resolvedState } : {}),
         ...(typeof state?.iteration === "number" ? { iteration: state.iteration } : {}),
         ...(state?.plan_hash ? { plan_hash: state.plan_hash } : {}),
         ...(expectedPlanHash ? { expected_plan_hash: expectedPlanHash, plan_hash_mismatch: planHashMismatch } : {}),
         ...(state && "exit_code" in state ? { exit_code: state.exit_code } : {}),
         ...(state && "timed_out" in state ? { timed_out: state.timed_out } : {}),
+        ...(typeof state?.pid === "number" ? { pid: state.pid } : {}),
+        ...(typeof state?.child_pid === "number" ? { child_pid: state.child_pid } : {}),
+        ...(recordedPidAlive !== undefined ? { recorded_pid_alive: recordedPidAlive } : {}),
+        ...(recordedChildPidAlive !== undefined ? { recorded_child_pid_alive: recordedChildPidAlive } : {}),
+        ...(state?.interrupted_signal ? { interrupted_signal: state.interrupted_signal } : {}),
+        ...(state?.interrupted_at ? { interrupted_at: state.interrupted_at } : {}),
+        ...(state?.execution_outcome ? { execution_outcome: state.execution_outcome } : {}),
+        ...(state?.remote_mutations ? { remote_mutations: state.remote_mutations } : {}),
         ...(state?.started_at ? { started_at: state.started_at } : {}),
         ...(state?.finished_at ? { finished_at: state.finished_at } : {}),
         ...(state?.executor ? { executor: state.executor } : {}),
@@ -2854,39 +2724,51 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       };
 
       if (awaitedTerminal) {
-        const statusFile = bridgeArtifact(state?.status_file, `${config.contextDir}/agent-status.md`);
-        const diffFile = bridgeArtifact(state?.diff_file, `${config.contextDir}/implementation-diff.patch`);
-        const logFile = bridgeArtifact(state?.log_file, `${config.contextDir}/execution-log.jsonl`);
-        const testsFile = bridgeArtifact(state?.tests_file, `${config.contextDir}/loop-tests.txt`);
-        structured.status_file = statusFile;
-        structured.diff_file = diffFile;
-        structured.log_file = logFile;
-        const status = await excerpt(statusFile, 6_000);
-        if (status) structured.status_excerpt = status;
+        if (typeof state?.status_file === "string") {
+          const statusFile = bridgeArtifact(state.status_file, `${config.contextDir}/agent-status.md`);
+          structured.status_file = statusFile;
+          const status = await excerpt(statusFile, 6_000);
+          if (status) structured.status_excerpt = status;
+        }
         if (includeDiff) {
-          const diff = await excerpt(diffFile, 12_000);
-          if (diff) structured.diff_excerpt = diff;
+          if (typeof state?.diff_file === "string") {
+            const diffFile = bridgeArtifact(state.diff_file, `${config.contextDir}/implementation-diff.patch`);
+            structured.diff_file = diffFile;
+            const diff = await excerpt(diffFile, 12_000);
+            if (diff) structured.diff_excerpt = diff;
+          }
         }
         if (includeLog) {
-          const log = await excerpt(logFile, 6_000, 20);
-          if (log) structured.log_excerpt = log;
+          if (typeof state?.log_file === "string") {
+            const logFile = bridgeArtifact(state.log_file, `${config.contextDir}/execution-log.jsonl`);
+            structured.log_file = logFile;
+            const log = await excerpt(logFile, 6_000, 20);
+            if (log) structured.log_excerpt = log;
+          }
         }
         if (includeTests) {
-          const tests = await excerpt(testsFile, 4_000);
-          if (tests) {
-            structured.tests_file = testsFile;
-            structured.tests_excerpt = tests;
+          if (typeof state?.tests_file === "string") {
+            const testsFile = bridgeArtifact(state.tests_file, `${config.contextDir}/loop-tests.txt`);
+            const tests = await excerpt(testsFile, 4_000);
+            if (tests) {
+              structured.tests_file = testsFile;
+              structured.tests_excerpt = tests;
+            }
           }
         }
       }
 
       const summary = !state
         ? `No handoff run state found at ${stateRel}. Start a run with handoff_to_agent + local execute-handoff/watch-handoff, then call wait_for_handoff again.`
-        : awaitedTerminal
-          ? `Handoff run ${state.state} (iteration ${state.iteration ?? 1}, exit ${state.exit_code ?? "null"}).`
-          : planHashMismatch
-            ? `Executor has not completed the expected plan yet (last known run plan_hash=${state.plan_hash ?? "unknown"}). Still waiting.`
-            : `Handoff run is ${state.state}. Re-poll after ~${Math.max(1, Math.ceil(pollMs / 1000))}s.`;
+        : awaitedTerminal && resolvedState === "orphaned"
+          ? `Handoff run state is stale: recorded executor PID ${state.pid ?? "unknown"} no longer exists. The execution outcome may be ambiguous; reconcile Git and target state before retry.`
+          : awaitedTerminal && resolvedState === "interrupted"
+            ? `Handoff run was interrupted by ${state.interrupted_signal ?? "a parent signal"}. Reconcile Git and target state before retrying any material side effect.`
+            : awaitedTerminal
+              ? `Handoff run ${resolvedState} (iteration ${state.iteration ?? 1}, exit ${state.exit_code ?? "null"}).`
+              : planHashMismatch
+                ? `Executor has not completed the expected plan yet (last known run plan_hash=${state.plan_hash ?? "unknown"}). Still waiting.`
+                : `Handoff run is ${state.state}. Re-poll after ~${Math.max(1, Math.ceil(pollMs / 1000))}s.`;
 
       const lines = [
         "# Wait For Handoff",
@@ -3092,6 +2974,111 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
             resume_cursor: result.resume_cursor,
             next_cursor: result.next_cursor ?? null,
             has_more: result.has_more,
+            source_size_bytes: result.source_size_bytes,
+            codex_sessions_mode: config.codexSessions
+          });
+        }
+      );
+
+      registerCodexTool(
+        config,
+        server,
+        "search_codex_session",
+        {
+          title: "Search Codex Session",
+          description:
+            "Opt-in, read-only bounded search over parsed Codex session messages. Returns byte offsets that can be passed to read_codex_session_around without loading the whole transcript into memory.",
+          inputSchema: {
+            session_id: z.string().optional().describe("Codex session id from codex_sessions."),
+            source_path: z.string().optional().describe("Source path from codex_sessions. Must be inside the configured Codex session roots."),
+            query: z.string().min(1).describe("Case-insensitive text to find in message content, tool calls, or tool output."),
+            roles: z.array(z.string().min(1)).max(12).optional().describe("Optional roles to include, such as user, assistant, or tool."),
+            tool_names: z.array(z.string().min(1)).max(40).optional().describe("Optional exact tool names for function_call messages."),
+            time_from: z.union([z.string(), z.number()]).optional().describe("Optional inclusive ISO timestamp or Unix milliseconds lower bound."),
+            time_to: z.union([z.string(), z.number()]).optional().describe("Optional inclusive ISO timestamp or Unix milliseconds upper bound."),
+            max_results: z.number().int().min(1).max(100).optional().describe("Maximum matches to return. Default: 30."),
+            max_snippet_bytes: z.number().int().min(80).max(4000).optional().describe("Maximum UTF-8 bytes per match snippet. Default: 600.")
+          },
+          annotations: READ_ONLY_ANNOTATIONS,
+          _meta: {
+            ...toolCardMeta(),
+            "openai/toolInvocation/invoking": "Searching local Codex session...",
+            "openai/toolInvocation/invoked": "Codex session search ready"
+          }
+        },
+        async (args) => {
+          const result = await searchCodexSession(config, {
+            sessionId: args.session_id,
+            sourcePath: args.source_path,
+            query: String(args.query ?? ""),
+            roles: args.roles,
+            toolNames: args.tool_names,
+            timeFrom: args.time_from,
+            timeTo: args.time_to,
+            maxResults: args.max_results,
+            maxSnippetBytes: args.max_snippet_bytes
+          });
+          return textResult(result.text, {
+            session: result.session,
+            matches: result.matches,
+            match_count: result.matches.length,
+            truncated: result.truncated,
+            source_size_bytes: result.source_size_bytes,
+            codex_sessions_mode: config.codexSessions
+          });
+        }
+      );
+
+      registerCodexTool(
+        config,
+        server,
+        "read_codex_session_around",
+        {
+          title: "Read Around Codex Session",
+          description:
+            "Opt-in, read-only bounded contextual transcript reader. Use the message_id or byte_offset returned by search_codex_session, or locate the first message at a timestamp.",
+          inputSchema: {
+            session_id: z.string().optional().describe("Codex session id from codex_sessions."),
+            source_path: z.string().optional().describe("Source path from codex_sessions. Must be inside the configured Codex session roots."),
+            message_id: z.string().optional().describe("Byte-offset message_id returned by search_codex_session."),
+            byte_offset: z.number().int().min(0).optional().describe("Byte offset returned by search_codex_session."),
+            timestamp: z.union([z.string(), z.number()]).optional().describe("Locate the first parsed message at or after this ISO timestamp or Unix millisecond value."),
+            before: z.number().int().min(0).max(100).optional().describe("Messages before the target. Default: 10."),
+            after: z.number().int().min(0).max(100).optional().describe("Messages after the target. Default: 10."),
+            max_total_bytes: z.number().int().min(4000).max(400000).optional().describe("Maximum UTF-8 transcript content bytes. Default: 80000."),
+            exclude_tool_outputs: z.boolean().optional().describe("Exclude function_call_output messages. Default: false."),
+            max_tool_output_bytes: z.number().int().min(0).max(400000).optional().describe("Maximum bytes retained per tool output. Default: 20000.")
+          },
+          annotations: READ_ONLY_ANNOTATIONS,
+          _meta: {
+            ...toolCardMeta(),
+            "openai/toolInvocation/invoking": "Reading around Codex session...",
+            "openai/toolInvocation/invoked": "Codex session context ready"
+          }
+        },
+        async (args) => {
+          const result = await readCodexSessionAround(config, {
+            sessionId: args.session_id,
+            sourcePath: args.source_path,
+            messageId: args.message_id,
+            byteOffset: args.byte_offset,
+            timestamp: args.timestamp,
+            before: args.before,
+            after: args.after,
+            maxTotalBytes: args.max_total_bytes,
+            excludeToolOutputs: args.exclude_tool_outputs,
+            maxToolOutputBytes: args.max_tool_output_bytes
+          });
+          return textResult(result.text, {
+            session: result.session,
+            messages: result.messages,
+            message_count: result.messages.length,
+            target: result.target,
+            before: result.before,
+            after: result.after,
+            has_more_before: result.has_more_before,
+            has_more_after: result.has_more_after,
+            truncated: result.truncated,
             source_size_bytes: result.source_size_bytes,
             codex_sessions_mode: config.codexSessions
           });

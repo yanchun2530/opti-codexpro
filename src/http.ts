@@ -3,7 +3,6 @@ import { randomUUID } from "node:crypto";
 import { timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
-import cors from "cors";
 import { z } from "zod";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
@@ -20,6 +19,9 @@ import {
 } from "./profileStore.js";
 import { redactSensitiveText, redactStructured } from "./redact.js";
 import { createCodexProServer } from "./server.js";
+import { WorkspaceRegistry } from "./guard.js";
+import { redactConfigPaths } from "./pathLabels.js";
+import { CODEXPRO_VERSION } from "./version.js";
 
 function escapeHtml(value: unknown): string {
   return String(value ?? "")
@@ -382,7 +384,7 @@ function buildProfilePayload(config: CodexProConfig, existing: WorkspaceProfile,
 function profileResponse(config: CodexProConfig): Record<string, unknown> {
   const profile = readWorkspaceProfile(config.defaultRoot);
   const runtime = readRuntimeConnection(config.defaultRoot);
-  return redactStructured({
+  return redactConfigPaths(config, redactStructured({
     ok: true,
     profile_path: profile.profilePath ?? profilePathForRoot(config.defaultRoot),
     exists: Boolean(profile.profilePath),
@@ -401,7 +403,7 @@ function profileResponse(config: CodexProConfig): Record<string, unknown> {
       widgetDomain: config.widgetDomain,
       authEnabled: Boolean(config.authToken)
     }
-  });
+  }), { labelUnknownPaths: true });
 }
 
 function jsonError(res: Response, status: number, code: string, message: string, issues?: unknown): void {
@@ -416,8 +418,6 @@ const LOCAL_FAVICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 6
   <rect x="8" y="8" width="48" height="48" rx="12" fill="#ffffff" fill-opacity=".12" stroke="#ffffff" stroke-opacity=".38"/>
   <path d="M38.4 40.3c-1.8 1.1-3.9 1.7-6.3 1.7-6.1 0-10.3-4.2-10.3-10s4.2-10 10.4-10c2.4 0 4.5.6 6.2 1.7l-2.1 4.1c-1.1-.7-2.3-1-3.8-1-2.9 0-4.9 2.1-4.9 5.2s2 5.2 4.9 5.2c1.5 0 2.8-.4 3.9-1.1l2 4.2Z" fill="#ffffff"/>
 </svg>`;
-const CODEXPRO_VERSION = "0.30.0";
-
 function printHelp(): void {
   console.log(`CodexPro MCP HTTP server
 
@@ -439,9 +439,9 @@ function onboardingPage(config: CodexProConfig): string {
   const writeTone = config.writeMode === "workspace" ? "agent" : config.writeMode;
   const rootArg = shellQuote(config.defaultRoot);
   const sessionArg = shellQuote(config.bashSessionId || "main");
-  const githubUrl = "https://github.com/your-org/opti-codexpro";
-  const npmUrl = "https://www.npmjs.com/package/codexpro";
-  const docsUrl = "https://example.com/opti-codexpro/";
+  const githubUrl = "https://github.com/yanchun2530/opti-codexpro";
+  const npmUrl = "https://www.npmjs.com/package/opti-codexpro";
+  const docsUrl = "https://github.com/yanchun2530/opti-codexpro/tree/main/docs";
   const chatgptUrl = "https://chatgpt.com/#settings/Connectors";
   const controls = [
     copyCommand("Re-run setup wizard", "Use the CLI for broader profile edits that are intentionally not exposed here.", "codexpro setup"),
@@ -1323,6 +1323,7 @@ function onboardingPage(config: CodexProConfig): string {
       const cleanSearch = initialUrl.searchParams.toString();
       history.replaceState(null, "", initialUrl.pathname + (cleanSearch ? "?" + cleanSearch : "") + initialUrl.hash);
     }
+    const adminProfileUrl = "/admin/profile" + (connectorToken ? "?codexpro_token=" + encodeURIComponent(connectorToken) : "");
     document.querySelectorAll("[data-copy], [data-copy-kind]").forEach((button) => {
       button.addEventListener("click", async () => {
         let value = button.getAttribute("data-copy") || "";
@@ -1415,7 +1416,7 @@ function onboardingPage(config: CodexProConfig): string {
         };
         if (status) status.textContent = "Saving...";
         try {
-          const response = await fetch("/admin/profile" + window.location.search, {
+          const response = await fetch(adminProfileUrl, {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify(payload)
@@ -1455,6 +1456,20 @@ async function main(): Promise<void> {
 
   const app = express();
   const logRequests = process.env.CODEXPRO_LOG_REQUESTS === "1";
+  const connectionDiagnostics = {
+    server_started_at: new Date().toISOString(),
+    requests_received: 0,
+    auth_failures: 0,
+    mcp_requests_received: 0,
+    mcp_dispatches_started: 0,
+    mcp_responses_completed: 0,
+    mcp_errors: 0,
+    last_request_at: null as string | null,
+    last_mcp_request_at: null as string | null,
+    last_dispatch_started_at: null as string | null,
+    last_response_completed_at: null as string | null,
+    last_auth_failure_at: null as string | null
+  };
   const authFailureWindow = new Map<string, { count: number; resetAt: number }>();
   const authFailureLimit = 10;
 
@@ -1493,19 +1508,56 @@ async function main(): Promise<void> {
     next();
   }
 
+  function sameOriginAdminRequest(req: Request, res: Response, next: NextFunction): void {
+    const origin = req.headers.origin;
+    if (!origin) {
+      next();
+      return;
+    }
+    const host = req.get("host");
+    let originHost: string;
+    try {
+      originHost = new URL(origin).host;
+    } catch {
+      jsonError(res, 403, "origin_denied", "Cross-origin admin requests are not allowed.");
+      return;
+    }
+    // A tunnel may terminate TLS before forwarding to this HTTP process, so compare the
+    // browser Origin host with the forwarded Host instead of requiring matching schemes.
+    if (!host || originHost !== host) {
+      jsonError(res, 403, "origin_denied", "Cross-origin admin requests are not allowed.");
+      return;
+    }
+    next();
+  }
+
   app.use((req, res, next) => {
+    const requestTime = new Date().toISOString();
+    const incomingRequestId = Array.isArray(req.headers["x-codexpro-request-id"])
+      ? req.headers["x-codexpro-request-id"][0]
+      : req.headers["x-codexpro-request-id"];
+    const requestId = typeof incomingRequestId === "string" && /^[A-Za-z0-9._:-]{1,96}$/.test(incomingRequestId)
+      ? incomingRequestId
+      : randomUUID();
+    (req as Request & { codexproRequestId?: string }).codexproRequestId = requestId;
+    res.setHeader("X-CodexPro-Request-Id", requestId);
+    connectionDiagnostics.requests_received += 1;
+    connectionDiagnostics.last_request_at = requestTime;
+    if (req.path === "/mcp") {
+      connectionDiagnostics.mcp_requests_received += 1;
+      connectionDiagnostics.last_mcp_request_at = requestTime;
+    }
     if (!logRequests) {
       next();
       return;
     }
     const started = Date.now();
-    console.error(`[CodexPro] ${req.method} ${req.path} received`);
+    console.error(`[CodexPro] ${req.method} ${req.path} received request_id=${requestId}`);
     res.on("finish", () => {
-      console.error(`[CodexPro] ${req.method} ${req.path} -> ${res.statusCode} ${Date.now() - started}ms`);
+      console.error(`[CodexPro] ${req.method} ${req.path} -> ${res.statusCode} ${Date.now() - started}ms request_id=${requestId}`);
     });
     next();
   });
-  app.use(cors({ exposedHeaders: ["Mcp-Session-Id"] }));
   app.get("/favicon.ico", (_req, res) => {
     res.setHeader("Cache-Control", "public, max-age=86400");
     res.type("image/svg+xml").send(LOCAL_FAVICON);
@@ -1514,7 +1566,9 @@ async function main(): Promise<void> {
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("Pragma", "no-cache");
     res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
     res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
     next();
   });
   app.use((req, res, next) => {
@@ -1538,6 +1592,8 @@ async function main(): Promise<void> {
     const current = authFailureWindow.get(key);
     if (!current || current.resetAt <= now) {
       authFailureWindow.set(key, { count: 1, resetAt: now + 60_000 });
+      connectionDiagnostics.auth_failures += 1;
+      connectionDiagnostics.last_auth_failure_at = new Date(now).toISOString();
       res.status(401).send("Unauthorized");
       return;
     }
@@ -1548,10 +1604,14 @@ async function main(): Promise<void> {
       }
     }
     if (current.count > authFailureLimit) {
+      connectionDiagnostics.auth_failures += 1;
+      connectionDiagnostics.last_auth_failure_at = new Date(now).toISOString();
       res.setHeader("Retry-After", String(Math.max(1, Math.ceil((current.resetAt - now) / 1000))));
       res.status(429).send("Too Many Authentication Attempts");
       return;
     }
+    connectionDiagnostics.auth_failures += 1;
+    connectionDiagnostics.last_auth_failure_at = new Date(now).toISOString();
     res.status(401).send("Unauthorized");
   });
 
@@ -1559,10 +1619,10 @@ async function main(): Promise<void> {
     transport: StreamableHTTPServerTransport;
     createdAt: number;
     lastSeenAt: number;
-    activeRequests: number;
   };
 
   const transports = new Map<string, TransportRecord>();
+  const workspaceRegistry = new WorkspaceRegistry();
   const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
   function requestSessionId(req: Request): string | undefined {
@@ -1591,49 +1651,16 @@ async function main(): Promise<void> {
   function pruneTransports(): void {
     const now = Date.now();
     for (const [sessionId, record] of transports) {
-      if (record.activeRequests === 0 && now - record.lastSeenAt > config.httpSessionTtlMs) {
+      if (now - record.lastSeenAt > config.httpSessionTtlMs) {
         transports.delete(sessionId);
-        console.error('[CodexPro] pruning idle MCP session ' + sessionId + ' age_ms=' + (now - record.lastSeenAt));
         closeTransport(record);
       }
     }
-    // maxHttpSessions is a soft cap. ChatGPT may create short-lived MCP sessions
-    // in bursts, and immediately evicting recently-used sessions causes a
-    // reconnect/eviction feedback loop. Only pressure-evict inactive sessions
-    // that have been idle for a grace period.
-    const capacityGraceMs = Math.min(config.httpSessionTtlMs, 5 * 60_000);
     while (transports.size > config.maxHttpSessions) {
-      const oldestInactive = [...transports.entries()]
-        .filter(([, record]) => record.activeRequests === 0 && now - record.lastSeenAt > capacityGraceMs)
-        .sort((a, b) => a[1].lastSeenAt - b[1].lastSeenAt)[0];
-      if (!oldestInactive) break;
-      transports.delete(oldestInactive[0]);
-      console.error(
-        '[CodexPro] pruning aged inactive MCP session for capacity ' +
-          oldestInactive[0] +
-          ' age_ms=' +
-          (now - oldestInactive[1].lastSeenAt)
-      );
-      closeTransport(oldestInactive[1]);
-    }
-
-    // Keep a bounded emergency ceiling for pathological clients while still
-    // preferring inactive sessions. This is intentionally well above the soft
-    // cap so normal reconnect bursts never churn sessions.
-    const hardSessionCap = Math.max(config.maxHttpSessions * 4, 256);
-    while (transports.size > hardSessionCap) {
-      const oldestInactive = [...transports.entries()]
-        .filter(([, record]) => record.activeRequests === 0)
-        .sort((a, b) => a[1].lastSeenAt - b[1].lastSeenAt)[0];
-      if (!oldestInactive) break;
-      transports.delete(oldestInactive[0]);
-      console.error(
-        '[CodexPro] emergency pruning inactive MCP session ' +
-          oldestInactive[0] +
-          ' age_ms=' +
-          (now - oldestInactive[1].lastSeenAt)
-      );
-      closeTransport(oldestInactive[1]);
+      const oldest = [...transports.entries()].sort((a, b) => a[1].lastSeenAt - b[1].lastSeenAt)[0];
+      if (!oldest) break;
+      transports.delete(oldest[0]);
+      closeTransport(oldest[1]);
     }
   }
 
@@ -1644,24 +1671,6 @@ async function main(): Promise<void> {
     if (!record) return undefined;
     record.lastSeenAt = Date.now();
     return record.transport;
-  }
-
-  function trackActiveResponse(sessionId: string | undefined, res: Response): void {
-    if (!sessionId) return;
-    const record = transports.get(sessionId);
-    if (!record) return;
-    record.activeRequests += 1;
-    record.lastSeenAt = Date.now();
-
-    let released = false;
-    const release = () => {
-      if (released) return;
-      released = true;
-      record.activeRequests = Math.max(0, record.activeRequests - 1);
-      record.lastSeenAt = Date.now();
-    };
-    res.once("finish", release);
-    res.once("close", release);
   }
 
   const pruneTimer = setInterval(pruneTransports, Math.min(config.httpSessionTtlMs, 60_000));
@@ -1676,7 +1685,7 @@ async function main(): Promise<void> {
   });
 
   app.get("/healthz", (_req, res) => {
-    res.json({
+    res.json(redactConfigPaths(config, {
       ok: true,
       name: "CodexPro",
       defaultRoot: config.defaultRoot,
@@ -1690,21 +1699,17 @@ async function main(): Promise<void> {
       toolMode: config.toolMode,
       widgetDomain: config.widgetDomain,
       contextDir: config.contextDir,
-      httpSessions: {
-        total: transports.size,
-        active: [...transports.values()].filter((record) => record.activeRequests > 0).length,
-        softMax: config.maxHttpSessions
-      },
       authEnabled: Boolean(config.authToken),
-      authRequired: Boolean(config.authToken)
-    });
+      authRequired: Boolean(config.authToken),
+      connection_diagnostics: connectionDiagnostics
+    }, { labelUnknownPaths: true }));
   });
 
   app.get("/admin/profile", (_req, res) => {
     res.json(profileResponse(config));
   });
 
-  app.post("/admin/profile", adminRateLimit, adminBodyLimit, express.json({ limit: "32kb" }), (req, res) => {
+  app.post("/admin/profile", sameOriginAdminRequest, adminRateLimit, adminBodyLimit, express.json({ limit: "32kb" }), (req, res) => {
     const parsed = AdminProfilePatch.safeParse(req.body ?? {});
     if (!parsed.success) {
       jsonError(res, 400, "invalid_profile", "Invalid profile settings.", parsed.error.flatten());
@@ -1730,6 +1735,8 @@ async function main(): Promise<void> {
   });
 
   app.post("/mcp", express.json({ limit: "20mb" }), async (req, res) => {
+    connectionDiagnostics.mcp_dispatches_started += 1;
+    connectionDiagnostics.last_dispatch_started_at = new Date().toISOString();
     try {
       const sessionId = requestSessionId(req);
       let transport: StreamableHTTPServerTransport;
@@ -1737,7 +1744,6 @@ async function main(): Promise<void> {
       const existingTransport = getTransport(sessionId);
       if (existingTransport) {
         transport = existingTransport;
-        trackActiveResponse(sessionId, res);
       } else if (!sessionId && isInitializeRequest(req.body)) {
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
@@ -1746,8 +1752,7 @@ async function main(): Promise<void> {
             transports.set(newSessionId, {
               transport,
               createdAt: Date.now(),
-              lastSeenAt: Date.now(),
-              activeRequests: 0
+              lastSeenAt: Date.now()
             });
             pruneTransports();
           }
@@ -1758,7 +1763,7 @@ async function main(): Promise<void> {
           if (closedSessionId) transports.delete(closedSessionId);
         };
 
-        const server = createCodexProServer(config);
+        const server = createCodexProServer(config, { workspaceRegistry });
         await server.connect(transport);
       } else {
         sendSessionError(res, sessionId);
@@ -1766,7 +1771,10 @@ async function main(): Promise<void> {
       }
 
       await transport.handleRequest(req, res, req.body);
+      connectionDiagnostics.mcp_responses_completed += 1;
+      connectionDiagnostics.last_response_completed_at = new Date().toISOString();
     } catch (error) {
+      connectionDiagnostics.mcp_errors += 1;
       console.error(error instanceof Error ? error.stack ?? error.message : String(error));
       if (!res.headersSent) {
         res.status(500).json({
@@ -1785,7 +1793,6 @@ async function main(): Promise<void> {
       sendSessionError(res, sessionId);
       return;
     }
-    trackActiveResponse(sessionId, res);
     await transport.handleRequest(req, res);
   };
 

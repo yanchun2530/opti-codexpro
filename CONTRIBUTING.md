@@ -1,6 +1,6 @@
 # Contributing
 
-Opti-CodexPro is early. Good contributions make it safer, faster, and easier to explain.
+CodexPro is early. Good contributions make it safer, faster, and easier to explain.
 
 ## Local Setup
 

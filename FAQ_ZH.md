@@ -310,7 +310,7 @@ repo B: port 8788, hostname B, ChatGPT plugin URL B
 
 GitHub Pages 的 `owner.github.io` 只能由名为 `owner` 的 GitHub 用户或组织使用。
 
-`codexpro` 这个 GitHub 用户名已经存在，所以 `your-org` 账号下的项目不能使用 `codexpro.github.io`。
+GitHub Pages 不是必需项。如果发布项目文档，请将 Pages 地址配置为你自己的仓库或部署地址。
 
 当前干净的 GitHub Pages 地址是：
 

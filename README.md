@@ -15,6 +15,8 @@
 
 Opti-CodexPro is a local MCP server. It connects **your ChatGPT session** to **your machine** and **repos you allow**.
 
+This repository is based on CodexPro `0.30.2` and adds the web-native `optillm_runtime` tool.
+
 ChatGPT can read, search, edit, review, verify, import attachments, and write handoff plans. It stays inside those roots.
 
 It is not a hosted SaaS product, model proxy, quota bypass, account pool, or remote shell service.
@@ -28,7 +30,7 @@ Needs:
 - An HTTPS URL to your machine for ChatGPT web (tunnel or Tailscale Funnel)
 
 ```bash
-git clone https://github.com/your-org/opti-codexpro.git
+git clone https://github.com/yanchun2530/opti-codexpro.git
 cd opti-codexpro
 npm install
 npm run build
@@ -91,6 +93,7 @@ never commit a real hostname, token, account name, or home-directory path.
    opti-codexpro start `
      --root C:\path\to\repo `
      --bash safe `
+     --bash-runtime powershell `
      --write workspace `
      --tunnel tailscale `
      --hostname <device-funnel-hostname>
@@ -227,8 +230,8 @@ Inspect or cancel a run with:
 ```
 
 Available approaches are `auto`, `re2`, `bon`, `cot_reflection`, `self_consistency`, `moa`, `plansearch`,
-`rto`, `z3`, `leap`, `cepo`, and `mars`. The legacy tools `think` and `reasoning_runtime` remain available
-as compatibility aliases and are routed to the same OptiLLM runtime.
+`rto`, `z3`, `leap`, `cepo`, and `mars`. Only the public `optillm_runtime` tool is exposed; the legacy
+`think` and `reasoning_runtime` aliases are intentionally not included.
 
 This runtime reports stage progress, prompts, candidates, verifier results, and the final result. It does not
 expose a model's private hidden chain-of-thought; use the structured stage data when a visible progress trail is needed.
