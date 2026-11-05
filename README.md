@@ -60,6 +60,8 @@ opti-codexpro start
 
 If plugin creation fails, run `opti-codexpro connection-test` and check whether ChatGPT requests reach the local server.
 
+For recurring GPT Web CX timeouts, see the [Chinese CX/Funnel troubleshooting runbook](docs/CX-MCP-FUNNEL-RUNBOOK.zh-CN.md).
+
 ### Complete setup with Tailscale Funnel
 
 The following is the recommended ChatGPT Web setup. Replace every placeholder locally;
